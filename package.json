@@ -1,0 +1,32 @@
+{
+  "name": "jamroom-syncronization-service",
+  "version": "1.0.0",
+  "description": "Backend for syncronization service",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JamRoomOrganization/jamroom-syncronization-service.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/JamRoomOrganization/jamroom-syncronization-service/issues"
+  },
+  "homepage": "https://github.com/JamRoomOrganization/jamroom-syncronization-service#readme",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "redis": "^5.9.0",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}
