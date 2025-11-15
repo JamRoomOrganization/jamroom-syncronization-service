@@ -74,12 +74,7 @@ export const AuthService = {
 
         await RedisService.clearRoomHost(roomId);
         cacheSet(roomId, null);
-        // TODO: host reassignment
-        //   En producción podríamos elegir un nuevo host automáticamente:
-        //   - Consultar el adapter de Socket.IO para ver quién sigue conectado.
-        //   - Escoger determinísticamente (ej. el más antiguo).
-        //   - setRoomHostIfEmpty(roomId, newUserId).
-        //   Por ahora dejamos la sala sin host hasta que alguien reclame play.
+
         return true;
     },
 };

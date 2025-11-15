@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import { initRedis, shutdownRedis } from './config/redis.js';
 import { registerSyncRoutes } from './controllers/syncController.js';
 import { initSyncGateway } from './sockets/syncGateway.js';
+import { requestLogger } from './utils/requestLogger.js';
 
 dotenv.config();
 
@@ -28,6 +29,9 @@ async function start() {
                 credentials: true,
             }),
         );
+
+        // Request ID propagation middleware
+        app.use(requestLogger);
 
         app.get('/__health', (req, res) => {
             res.json({ ok: true });

@@ -1,15 +1,52 @@
 import { RedisService } from '../services/redisService.js';
 import { SyncDomainService } from '../services/syncDomainService.js';
-
-function getRequestId(req) {
-    return req.headers['x-request-id'] || `req-${Date.now()}`;
-}
+import { redisClient, pubClient, subClient } from '../config/redis.js';
+import { getRequestId } from '../utils/requestLogger.js';
 
 export function registerSyncRoutes(app) {
 
-
+    // NOTE: Health check endpoint for load balancers and monitoring
+    // Returns 200 OK if all Redis clients are healthy
+    // Returns 503 Service Unavailable if any Redis client is down
     app.get('/health', async (req, res) => {
-        res.json({ status: 'ok', service: 'sync-service' });
+        const checks = {
+            redis: false,
+            redisPub: false,
+            redisSub: false,
+        };
+
+        // Check main Redis client
+        try {
+            await redisClient.ping();
+            checks.redis = true;
+        } catch (err) {
+            console.error('[health] Redis main client unhealthy', err.message);
+        }
+
+        // Check pub client
+        try {
+            await pubClient.ping();
+            checks.redisPub = true;
+        } catch (err) {
+            console.error('[health] Redis pub client unhealthy', err.message);
+        }
+
+        // Check sub client
+        try {
+            await subClient.ping();
+            checks.redisSub = true;
+        } catch (err) {
+            console.error('[health] Redis sub client unhealthy', err.message);
+        }
+
+        const healthy = checks.redis && checks.redisPub && checks.redisSub;
+
+        res.status(healthy ? 200 : 503).json({
+            status: healthy ? 'ok' : 'degraded',
+            checks,
+            uptime: Math.floor(process.uptime()),
+            timestamp: Date.now(),
+        });
     });
 
     app.get('/v1/tracks/:trackId/streamUrl', async (req, res) => {
@@ -27,8 +64,11 @@ export function registerSyncRoutes(app) {
 
 
     app.get('/v1/rooms/:roomId/state', async (req, res) => {
-        const requestId = getRequestId(req);
+        const requestId = getRequestId();
         const { roomId } = req.params;
+
+        // NOTE: Prevent caching of room state - always fetch fresh from Redis
+        res.set('Cache-Control', 'no-store');
 
         try {
             const roomState = await RedisService.getRoomState(roomId);
@@ -59,12 +99,19 @@ export function registerSyncRoutes(app) {
     });
 
     app.post('/v1/rooms/:roomId/play', async (req, res) => {
-        const requestId = getRequestId(req);
+        const requestId = getRequestId();
         const { roomId } = req.params;
         const { userId, trackId, startPositionMs = 0 } = req.body || {};
 
-        if (!userId || !trackId) {
-            return res.status(400).json({ error: 'invalid_body' });
+        // NOTE: Validate required fields and types
+        if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+            return res.status(400).json({ error: 'invalid_body', field: 'userId' });
+        }
+        if (!trackId || typeof trackId !== 'string' || trackId.trim().length === 0) {
+            return res.status(400).json({ error: 'invalid_body', field: 'trackId' });
+        }
+        if (typeof startPositionMs !== 'number' || !Number.isFinite(startPositionMs) || startPositionMs < 0) {
+            return res.status(400).json({ error: 'invalid_body', field: 'startPositionMs' });
         }
 
         try {
@@ -93,12 +140,12 @@ export function registerSyncRoutes(app) {
 
 
     app.post('/v1/rooms/:roomId/pause', async (req, res) => {
-        const requestId = getRequestId(req);
+        const requestId = getRequestId();
         const { roomId } = req.params;
         const { userId } = req.body || {};
 
-        if (!userId) {
-            return res.status(400).json({ error: 'invalid_body' });
+        if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+            return res.status(400).json({ error: 'invalid_body', field: 'userId' });
         }
 
         try {
@@ -125,12 +172,15 @@ export function registerSyncRoutes(app) {
 
 
     app.post('/v1/rooms/:roomId/seek', async (req, res) => {
-        const requestId = getRequestId(req);
+        const requestId = getRequestId();
         const { roomId } = req.params;
         const { userId, positionMs } = req.body || {};
 
-        if (!userId || typeof positionMs !== 'number') {
-            return res.status(400).json({ error: 'invalid_body' });
+        if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+            return res.status(400).json({ error: 'invalid_body', field: 'userId' });
+        }
+        if (typeof positionMs !== 'number' || !Number.isFinite(positionMs) || positionMs < 0) {
+            return res.status(400).json({ error: 'invalid_body', field: 'positionMs' });
         }
 
         try {
@@ -158,12 +208,18 @@ export function registerSyncRoutes(app) {
 
 
     app.post('/v1/rooms/:roomId/track', async (req, res) => {
-        const requestId = getRequestId(req);
+        const requestId = getRequestId();
         const { roomId } = req.params;
         const { userId, trackId, startPositionMs = 0 } = req.body || {};
 
-        if (!userId || !trackId) {
-            return res.status(400).json({ error: 'invalid_body' });
+        if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+            return res.status(400).json({ error: 'invalid_body', field: 'userId' });
+        }
+        if (!trackId || typeof trackId !== 'string' || trackId.trim().length === 0) {
+            return res.status(400).json({ error: 'invalid_body', field: 'trackId' });
+        }
+        if (typeof startPositionMs !== 'number' || !Number.isFinite(startPositionMs) || startPositionMs < 0) {
+            return res.status(400).json({ error: 'invalid_body', field: 'startPositionMs' });
         }
 
         try {

@@ -10,6 +10,7 @@ import { decideCorrection } from '../utils/driftLogic.js';
 import { Metrics } from '../utils/metrics.js';
 import { pubClient, subClient } from '../config/redis.js';
 import { enforceRoomRateLimit } from '../utils/rateLimiter.js';
+import { withWsRequestId, getRequestId } from '../utils/requestLogger.js';
 
 const CONTROL_CHANNEL_PATTERN = 'room:*:control';
 const roomChannel = (roomId) => `room:${roomId}`;
@@ -202,6 +203,7 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     RedisService.computeCurrentPosition(state, now),
                 );
 
+                // NOTE: syncPacket sent every 1s to all clients in room for drift correction
                 io.to(roomChannel(roomId)).emit('syncPacket', {
                     roomId,
                     serverTimeMs: now,
@@ -210,6 +212,16 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     trackId: state.trackId ?? null,
                     version: state.version ?? 0,
                 });
+
+                // Log only when state changes or periodically (every 30s)
+                if (state.version % 30 === 0 || state.version < 3) {
+                    console.log('[syncGateway] syncPacket', {
+                        roomId,
+                        users: localSize,
+                        state: state.playbackState,
+                        version: state.version,
+                    });
+                }
             } catch (error) {
                 console.error(`Failed to emit syncPacket for room ${roomId}`, error);
             }
@@ -254,9 +266,9 @@ export function initSyncGateway(httpServer, { cors } = {}) {
     const registerSocketHandlers = (socket) => {
         // TODO production auth:
         // - Extraer token JWT de socket.handshake.auth.token (o headers).
-        // - Verificar firma y expiración.
+        // - Verificar firma y expiraciï¿½n.
         // - Derivar userId real del JWT.
-        // - Si es inválido -> socket.disconnect(true) y return.
+        // - Si es invï¿½lido -> socket.disconnect(true) y return.
         const resolvedUserId =
             socket.handshake.auth?.userId ||
             socket.handshake.query?.userId ||
@@ -266,7 +278,7 @@ export function initSyncGateway(httpServer, { cors } = {}) {
         socket.data.userId = resolvedUserId;
         socket.joinedRooms = new Set();
 
-        socket.on('joinRoom', ({ roomId } = {}) => {
+        socket.on('joinRoom', withWsRequestId(({ roomId } = {}) => {
             if (!isValidRoomId(roomId)) {
                 return;
             }
@@ -278,13 +290,22 @@ export function initSyncGateway(httpServer, { cors } = {}) {
             ensureRoomActive(roomId);
             Metrics.userJoin(roomId, socket.userId);
 
+            const roomSize = getLocalRoomSize(io, roomId);
+            console.log('[syncGateway] user_joined_room', {
+                requestId: getRequestId(),
+                socketId: socket.id,
+                roomId,
+                userId: socket.userId,
+                roomSize,
+            });
+
             io.to(channel).emit('roomUserJoin', {
                 roomId,
                 userId: socket.userId,
             });
-        });
+        }));
 
-        socket.on('leaveRoom', ({ roomId } = {}) => {
+        socket.on('leaveRoom', withWsRequestId(({ roomId } = {}) => {
             if (!isValidRoomId(roomId)) {
                 return;
             }
@@ -295,15 +316,25 @@ export function initSyncGateway(httpServer, { cors } = {}) {
             socket.joinedRooms.delete(roomId);
 
             Metrics.userLeave(roomId, socket.userId);
+
+            const roomSize = getLocalRoomSize(io, roomId);
+            console.log('[syncGateway] user_left_room', {
+                requestId: getRequestId(),
+                socketId: socket.id,
+                roomId,
+                userId: socket.userId,
+                roomSize,
+            });
+
             io.to(channel).emit('roomUserLeave', {
                 roomId,
                 userId: socket.userId,
             });
 
             cleanupRoomIfEmpty(roomId);
-        });
+        }));
 
-        socket.on('heartbeat', ({ roomId } = {}) => {
+        socket.on('heartbeat', withWsRequestId(({ roomId } = {}) => {
             if (!isValidRoomId(roomId)) {
                 return;
             }
@@ -313,16 +344,21 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                 roomId,
                 serverTimeMs: Date.now(),
             });
-        });
+        }));
 
-        socket.on('driftReport', (payload = {}) => {
+        socket.on('driftReport', withWsRequestId((payload = {}) => {
             handleDriftReport(socket, payload).catch((error) => {
-                console.error('Failed to process drift report', error);
+                console.error('[syncGateway] drift_report_error', {
+                    requestId: getRequestId(),
+                    socketId: socket.id,
+                    userId: socket.userId,
+                    error: error.message,
+                });
             });
-        });
+        }));
 
         // Only the room host (first controller) may emit control events.
-        socket.on('play', async ({ roomId, trackId, startPositionMs } = {}) => {
+        socket.on('play', withWsRequestId(async ({ roomId, trackId, startPositionMs } = {}) => {
             await handleControlCommand({
                 action: 'play',
                 socket,
@@ -338,9 +374,9 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                         startPositionMs: typeof startPositionMs === 'number' ? startPositionMs : 0,
                     }),
             });
-        });
+        }));
 
-        socket.on('pause', async ({ roomId } = {}) => {
+        socket.on('pause', withWsRequestId(async ({ roomId } = {}) => {
             await handleControlCommand({
                 action: 'pause',
                 socket,
@@ -352,9 +388,9 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                         userId: socket.userId,
                     }),
             });
-        });
+        }));
 
-        socket.on('seek', async ({ roomId, positionMs } = {}) => {
+        socket.on('seek', withWsRequestId(async ({ roomId, positionMs } = {}) => {
             await handleControlCommand({
                 action: 'seek',
                 socket,
@@ -371,9 +407,9 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                         positionMs,
                     }),
             });
-        });
+        }));
 
-        socket.on('changeTrack', async ({ roomId, trackId, startPositionMs } = {}) => {
+        socket.on('changeTrack', withWsRequestId(async ({ roomId, trackId, startPositionMs } = {}) => {
             await handleControlCommand({
                 action: 'changeTrack',
                 socket,
@@ -388,10 +424,17 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                         startPositionMs: typeof startPositionMs === 'number' ? startPositionMs : 0,
                     }),
             });
-        });
+        }));
 
-        socket.on('disconnect', async () => {
+        socket.on('disconnect', withWsRequestId(async () => {
             const rooms = Array.from(socket.joinedRooms);
+
+            console.log('[syncGateway] user_disconnected', {
+                requestId: getRequestId(),
+                socketId: socket.id,
+                userId: socket.userId,
+                roomCount: rooms.length,
+            });
 
             for (const roomId of rooms) {
                 Metrics.userLeave(roomId, socket.userId);
@@ -406,6 +449,7 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                         await AuthService.maybeReleaseHost(roomId, socket.userId);
                     } catch (err) {
                         console.warn('[disconnect] failed to maybeReleaseHost', {
+                            requestId: getRequestId(),
                             roomId,
                             userId: socket.userId,
                             err,
@@ -415,16 +459,41 @@ export function initSyncGateway(httpServer, { cors } = {}) {
             }
 
             socket.joinedRooms.clear();
-        });
+        }));
     };
 
     const initialize = async () => {
-        await Promise.all([
-            pubClient.isOpen ? Promise.resolve() : pubClient.connect(),
-            subClient.isOpen ? Promise.resolve() : subClient.connect(),
-        ]);
+        // NOTE: Connect Redis pub/sub clients BEFORE initializing Socket.IO adapter
+        // This ensures adapter has working connections on multi-instance deployments
+        // Timeout prevents hanging on Redis unavailability
+        try {
+            await Promise.race([
+                Promise.all([
+                    pubClient.isOpen ? Promise.resolve() : pubClient.connect(),
+                    subClient.isOpen ? Promise.resolve() : subClient.connect(),
+                ]),
+                new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('Redis connection timeout (10s)')), 10000)
+                ),
+            ]);
 
-        io.adapter(createAdapter(pubClient, subClient));
+            // Initialize Redis adapter for multi-instance Socket.IO synchronization
+            io.adapter(createAdapter(pubClient, subClient));
+            console.log('[syncGateway] Redis adapter initialized for multi-instance deployment');
+        } catch (error) {
+            console.error('[syncGateway] Redis adapter initialization failed', {
+                error: error.message,
+            });
+
+            // NOTE: In single-node mode, Socket.IO can run without Redis adapter
+            // Set ALLOW_SINGLE_NODE=true for development or single-instance deployments
+            if (process.env.ALLOW_SINGLE_NODE === 'true') {
+                console.warn('[syncGateway] Running in SINGLE-NODE mode (no Redis adapter)');
+                console.warn('[syncGateway] Multi-instance deployment will NOT work correctly');
+            } else {
+                throw error;
+            }
+        }
 
         if (!handlersRegistered) {
             io.on('connection', registerSocketHandlers);
