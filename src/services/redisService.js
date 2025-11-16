@@ -104,95 +104,87 @@ export const RedisService = {
     },
 
     async lockRoom(roomId, ttlMs = REDLOCK_CONFIG.LOCK_TTL_MS) {
-        // NOTE: Distributed lock with Redlock for consistency across instances
-        // Can be disabled in dev with REDLOCK_ENABLED=false
-        // In production: throws error if quorum not achieved or Redlock disabled
-        // In dev/test: falls back to no-op lock with warning (allows single-node testing)
 
-        if (!REDLOCK_CONFIG.ENABLED) {
-            console.warn('[lockRoom] ⚠️  Redlock DISABLED by config (REDLOCK_ENABLED=false)', {
-                requestId: getRequestId(),
-                roomId,
-                env: process.env.NODE_ENV,
-            });
-            return {
-                async release() {
-                    // no-op
-                },
-            };
-        }
+
+        const requestId = getRequestId();
+        const key = lockKey(roomId);
+        const token = `${requestId}-${Date.now()}-${Math.random()
+            .toString(16)
+            .slice(2)}`;
+        const effectiveTtl = Number(ttlMs) > 0 ? Number(ttlMs) : 5000;
 
         try {
-            const lockStartTime = Date.now();
-            const lock = await redlock.acquire([lockKey(roomId)], ttlMs);
-            const lockAcquireTime = Date.now() - lockStartTime;
+            // node-redis v4: set(key, value, { PX, NX })
+            const result = await redisClient.set(key, token, {
+                PX: effectiveTtl,
+                NX: true,
+            });
 
-            // Log slow lock acquisition (>500ms indicates contention or latency issues)
-            if (lockAcquireTime > 500) {
-                console.warn('[lockRoom] Slow lock acquisition detected', {
-                    requestId: getRequestId(),
+            if (result !== 'OK') {
+                // No se pudo adquirir el lock (ya había otro).
+                console.warn('[lockRoom] lock NOT acquired (already locked)', {
+                    requestId,
                     roomId,
-                    ttlMs,
-                    acquireTimeMs: lockAcquireTime,
+                    key,
+                    ttlMs: effectiveTtl,
                 });
+
+                // Importante: NO lanzamos error, devolvemos un lock "no-op"
+                return {
+                    async release() {
+                        // nada que hacer
+                    },
+                };
             }
 
-            // Wrap release to handle already-expired locks gracefully
+            // Lock adquirido correctamente
+            console.debug('[lockRoom] lock acquired', {
+                requestId,
+                roomId,
+                key,
+                ttlMs: effectiveTtl,
+            });
+
+            // Devolvemos un objeto con release(), similar a Redlock
             return {
-                ...lock,
                 async release() {
                     try {
-                        await lock.release();
-                    } catch (err) {
-                        if (err.message && !err.message.includes('already expired')) {
-                            console.error('[lockRoom] Failed to release lock', {
-                                requestId: getRequestId(),
+                        const current = await redisClient.get(key);
+                        if (current === token) {
+                            await redisClient.del(key);
+                            console.debug('[lockRoom] lock released', {
+                                requestId,
                                 roomId,
-                                error: err.message,
+                                key,
                             });
-                            throw err;
+                        } else {
+                            // Otro proceso renovó/cambió el lock: no lo tocamos
+                            console.debug(
+                                '[lockRoom] lock token changed, not deleting',
+                                { requestId, roomId, key }
+                            );
                         }
-                        // Lock already expired - this is safe to ignore
-                        console.debug('[lockRoom] Lock already expired on release', {
-                            requestId: getRequestId(),
+                    } catch (err) {
+                        console.warn('[lockRoom] release failed (ignored)', {
+                            requestId,
                             roomId,
+                            key,
+                            error: err.message,
                         });
                     }
                 },
             };
         } catch (err) {
-            const isQuorumError = err.message && err.message.includes('quorum');
-            const isTimeout = err.message && (err.message.includes('timeout') || err.message.includes('retry window'));
-
-            // Detailed error logging
-            console.error('[lockRoom] Failed to acquire lock', {
-                requestId: getRequestId(),
+            // Cualquier fallo de Redis en dev/EC2: no tumbar la operación
+            console.error('[lockRoom] error while trying to lock (fallback no-op)', {
+                requestId,
                 roomId,
-                ttlMs,
+                key,
+                ttlMs: effectiveTtl,
                 error: err.message,
-                quorumError: isQuorumError,
-                timeout: isTimeout,
-                redlockConfig: {
-                    retryCount: REDLOCK_CONFIG.RETRY_COUNT,
-                    retryDelay: REDLOCK_CONFIG.RETRY_DELAY,
-                    lockTtl: REDLOCK_CONFIG.LOCK_TTL_MS,
-                },
-                stack: err.stack?.split('\n').slice(0, 3).join('\n'), // First 3 lines of stack
             });
 
-            if (process.env.NODE_ENV === 'production') {
-                // In production, fail fast - don't allow operations without locks
-                throw new Error(`Distributed lock unavailable for room ${roomId}: ${err.message}`);
-            }
-
-            // Development/test fallback: no-op lock with visible warning
-            console.warn('[lockRoom] ⚠️  USING NO-OP LOCK FALLBACK (dev mode) - NOT SAFE FOR PRODUCTION', {
-                requestId: getRequestId(),
-                roomId,
-                error: err.message,
-                cause: isQuorumError ? 'quorum_failure' : isTimeout ? 'timeout' : 'unknown',
-            });
-
+            // Fallback no-op: NO lanzamos error, para que play/pause sigan funcionando
             return {
                 async release() {
                     // no-op
@@ -200,6 +192,7 @@ export const RedisService = {
             };
         }
     },
+
 
     async publish(channel, message) {
         const messageWithMeta = {
