@@ -15,7 +15,10 @@ import { withWsRequestId, getRequestId } from '../utils/requestLogger.js';
 const CONTROL_CHANNEL_PATTERN = 'room:*:control';
 const roomChannel = (roomId) => `room:${roomId}`;
 
-const isValidRoomId = (roomId) => typeof roomId === 'string' && roomId.trim().length > 0;
+const isValidRoomId = (roomId) =>
+    typeof roomId === 'string' && roomId.trim().length > 0;
+
+const AUTH_BYPASS = process.env.AUTH_BYPASS === 'true';
 
 const CONTROL_LIMITS = {
     play: { max: 3, windowMs: 1000 },
@@ -46,13 +49,20 @@ const emitControlError = (socket, action, roomId, error) => {
     });
 };
 
+/**
+ * Maneja un comando de control (play, pause, seek, changeTrack)
+ * - Valida payload
+ * - Aplica rate limit por sala
+ * - Verifica permisos contra queue-service (AuthService.ensureCanControlPlayback)
+ * - Ejecuta la operación de dominio
+ */
 const handleControlCommand = async ({
-    action,
-    socket,
-    roomId,
-    payloadValidator,
-    domainCall,
-}) => {
+                                        action,
+                                        socket,
+                                        roomId,
+                                        payloadValidator,
+                                        domainCall,
+                                    }) => {
     if (!payloadValidator()) {
         emitControlError(socket, action, roomId, 'invalid_param');
         return;
@@ -60,21 +70,72 @@ const handleControlCommand = async ({
 
     const limits = CONTROL_LIMITS[action];
     if (limits) {
-        const allowed = await enforceRoomRateLimit(roomId, action, limits.max, limits.windowMs);
+        const allowed = await enforceRoomRateLimit(
+            roomId,
+            action,
+            limits.max,
+            limits.windowMs,
+        );
         if (!allowed) {
             emitControlError(socket, action, roomId, 'rate_limited');
             return;
         }
     }
 
-    const canControl = await AuthService.canControlRoom(socket.userId, roomId);
-    if (!canControl) {
-        emitControlError(socket, action, roomId, 'forbidden');
-        return;
+    // 🔐 Resolución de permisos: queue-service vía AuthService
+    let effectiveUserId = socket.userId;
+
+    if (!socket.data?.accessToken && AUTH_BYPASS) {
+        // Modo DEV: dejamos pasar, pero avisamos en logs
+        console.warn('[handleControlCommand] AUTH_BYPASS enabled, skipping permission check', {
+            action,
+            roomId,
+            socketId: socket.id,
+            userId: socket.userId,
+        });
+    } else {
+        try {
+            const membership = await AuthService.ensureCanControlPlayback({
+                accessToken: socket.data?.accessToken,
+                roomId,
+            });
+
+            // Tomamos el user_id real de room_members como userId efectivo
+            effectiveUserId =
+                membership.user_id || membership.userId || socket.userId;
+        } catch (err) {
+            console.warn('[handleControlCommand] permission denied/error', {
+                action,
+                roomId,
+                socketId: socket.id,
+                error: err.message,
+                code: err.code,
+            });
+
+            // Mapeo de códigos de error → mensajes simples para el cliente
+            switch (err.code) {
+                case 'MEMBERSHIP_NOT_FOUND':
+                    emitControlError(socket, action, roomId, 'membership_not_found');
+                    return;
+                case 'ROOM_CONTROL_FORBIDDEN':
+                case 'FORBIDDEN':
+                    emitControlError(socket, action, roomId, 'forbidden');
+                    return;
+                case 'UNAUTHORIZED':
+                    emitControlError(socket, action, roomId, 'unauthorized');
+                    return;
+                case 'QUEUE_SERVICE_UNAVAILABLE':
+                    emitControlError(socket, action, roomId, 'upstream_unavailable');
+                    return;
+                default:
+                    emitControlError(socket, action, roomId, 'internal_error');
+                    return;
+            }
+        }
     }
 
     try {
-        const result = await domainCall();
+        const result = await domainCall(effectiveUserId);
         socket.emit('controlAck', {
             action,
             roomId,
@@ -92,7 +153,7 @@ const handleControlCommand = async ({
 
         console.error(`Failed to process control action ${action}`, {
             roomId,
-            userId: socket.userId,
+            userId: effectiveUserId,
             error,
         });
         emitControlError(socket, action, roomId, 'internal_error');
@@ -264,13 +325,27 @@ export function initSyncGateway(httpServer, { cors } = {}) {
     };
 
     const registerSocketHandlers = (socket) => {
-        // TODO production auth:
-        // - Extraer token JWT de socket.handshake.auth.token (o headers).
-        // - Verificar firma y expiraci�n.
-        // - Derivar userId real del JWT.
-        // - Si es inv�lido -> socket.disconnect(true) y return.
+        // 🔐 Nuevo flujo de auth:
+        // - Tomamos accessToken del handshake (socket.handshake.auth.token)
+        // - Lo usamos en AuthService.ensureCanControlPlayback (queue-service + Cognito)
+        const rawAuth = socket.handshake.auth || {};
+        const accessToken = rawAuth.token || rawAuth.accessToken || null;
+
+        if (!accessToken && !AUTH_BYPASS) {
+            console.warn('[syncGateway] missing token, disconnecting socket', {
+                socketId: socket.id,
+            });
+            socket.emit('authError', { error: 'missing_token' });
+            socket.disconnect(true);
+            return;
+        }
+
+        socket.data.accessToken = accessToken;
+
+        // userId lógico solo para logs / métricas.
+        // En las operaciones de control usamos el user_id real devuelto por queue-service.
         const resolvedUserId =
-            socket.handshake.auth?.userId ||
+            rawAuth.userId ||
             socket.handshake.query?.userId ||
             `u-${socket.id}`;
 
@@ -278,188 +353,225 @@ export function initSyncGateway(httpServer, { cors } = {}) {
         socket.data.userId = resolvedUserId;
         socket.joinedRooms = new Set();
 
-        socket.on('joinRoom', withWsRequestId(({ roomId } = {}) => {
-            if (!isValidRoomId(roomId)) {
-                return;
-            }
+        socket.on(
+            'joinRoom',
+            withWsRequestId(({ roomId } = {}) => {
+                if (!isValidRoomId(roomId)) {
+                    return;
+                }
 
-            const channel = roomChannel(roomId);
-            socket.join(channel);
-            socket.joinedRooms.add(roomId);
+                const channel = roomChannel(roomId);
+                socket.join(channel);
+                socket.joinedRooms.add(roomId);
 
-            ensureRoomActive(roomId);
-            Metrics.userJoin(roomId, socket.userId);
+                ensureRoomActive(roomId);
+                Metrics.userJoin(roomId, socket.userId);
 
-            const roomSize = getLocalRoomSize(io, roomId);
-            console.log('[syncGateway] user_joined_room', {
-                requestId: getRequestId(),
-                socketId: socket.id,
-                roomId,
-                userId: socket.userId,
-                roomSize,
-            });
-
-            io.to(channel).emit('roomUserJoin', {
-                roomId,
-                userId: socket.userId,
-            });
-        }));
-
-        socket.on('leaveRoom', withWsRequestId(({ roomId } = {}) => {
-            if (!isValidRoomId(roomId)) {
-                return;
-            }
-
-            const channel = roomChannel(roomId);
-
-            socket.leave(channel);
-            socket.joinedRooms.delete(roomId);
-
-            Metrics.userLeave(roomId, socket.userId);
-
-            const roomSize = getLocalRoomSize(io, roomId);
-            console.log('[syncGateway] user_left_room', {
-                requestId: getRequestId(),
-                socketId: socket.id,
-                roomId,
-                userId: socket.userId,
-                roomSize,
-            });
-
-            io.to(channel).emit('roomUserLeave', {
-                roomId,
-                userId: socket.userId,
-            });
-
-            cleanupRoomIfEmpty(roomId);
-        }));
-
-        socket.on('heartbeat', withWsRequestId(({ roomId } = {}) => {
-            if (!isValidRoomId(roomId)) {
-                return;
-            }
-
-            ensureRoomActive(roomId);
-            socket.emit('heartbeatAck', {
-                roomId,
-                serverTimeMs: Date.now(),
-            });
-        }));
-
-        socket.on('driftReport', withWsRequestId((payload = {}) => {
-            handleDriftReport(socket, payload).catch((error) => {
-                console.error('[syncGateway] drift_report_error', {
+                const roomSize = getLocalRoomSize(io, roomId);
+                console.log('[syncGateway] user_joined_room', {
                     requestId: getRequestId(),
                     socketId: socket.id,
+                    roomId,
                     userId: socket.userId,
-                    error: error.message,
+                    roomSize,
                 });
-            });
-        }));
 
-        // Only the room host (first controller) may emit control events.
-        socket.on('play', withWsRequestId(async ({ roomId, trackId, startPositionMs } = {}) => {
-            await handleControlCommand({
-                action: 'play',
-                socket,
-                roomId,
-                payloadValidator: () => (
-                    isValidRoomId(roomId) && typeof trackId === 'string' && trackId.trim().length > 0
-                ),
-                domainCall: () =>
-                    SyncDomainService.play({
-                        roomId,
-                        userId: socket.userId,
-                        trackId: trackId.trim(),
-                        startPositionMs: typeof startPositionMs === 'number' ? startPositionMs : 0,
-                    }),
-            });
-        }));
-
-        socket.on('pause', withWsRequestId(async ({ roomId } = {}) => {
-            await handleControlCommand({
-                action: 'pause',
-                socket,
-                roomId,
-                payloadValidator: () => isValidRoomId(roomId),
-                domainCall: () =>
-                    SyncDomainService.pause({
-                        roomId,
-                        userId: socket.userId,
-                    }),
-            });
-        }));
-
-        socket.on('seek', withWsRequestId(async ({ roomId, positionMs } = {}) => {
-            await handleControlCommand({
-                action: 'seek',
-                socket,
-                roomId,
-                payloadValidator: () =>
-                    isValidRoomId(roomId) &&
-                    typeof positionMs === 'number' &&
-                    Number.isFinite(positionMs) &&
-                    positionMs >= 0,
-                domainCall: () =>
-                    SyncDomainService.seek({
-                        roomId,
-                        userId: socket.userId,
-                        positionMs,
-                    }),
-            });
-        }));
-
-        socket.on('changeTrack', withWsRequestId(async ({ roomId, trackId, startPositionMs } = {}) => {
-            await handleControlCommand({
-                action: 'changeTrack',
-                socket,
-                roomId,
-                payloadValidator: () =>
-                    isValidRoomId(roomId) && typeof trackId === 'string' && trackId.trim().length > 0,
-                domainCall: () =>
-                    SyncDomainService.changeTrack({
-                        roomId,
-                        userId: socket.userId,
-                        trackId: trackId.trim(),
-                        startPositionMs: typeof startPositionMs === 'number' ? startPositionMs : 0,
-                    }),
-            });
-        }));
-
-        socket.on('disconnect', withWsRequestId(async () => {
-            const rooms = Array.from(socket.joinedRooms);
-
-            console.log('[syncGateway] user_disconnected', {
-                requestId: getRequestId(),
-                socketId: socket.id,
-                userId: socket.userId,
-                roomCount: rooms.length,
-            });
-
-            for (const roomId of rooms) {
-                Metrics.userLeave(roomId, socket.userId);
-                io.to(roomChannel(roomId)).emit('roomUserLeave', {
+                io.to(channel).emit('roomUserJoin', {
                     roomId,
                     userId: socket.userId,
                 });
-                const localSize = getLocalRoomSize(io, roomId);
-                if (!localSize) {
-                    cleanupRoomIfEmpty(roomId);
-                    try {
-                        await AuthService.maybeReleaseHost(roomId, socket.userId);
-                    } catch (err) {
-                        console.warn('[disconnect] failed to maybeReleaseHost', {
-                            requestId: getRequestId(),
+            }),
+        );
+
+        socket.on(
+            'leaveRoom',
+            withWsRequestId(({ roomId } = {}) => {
+                if (!isValidRoomId(roomId)) {
+                    return;
+                }
+
+                const channel = roomChannel(roomId);
+
+                socket.leave(channel);
+                socket.joinedRooms.delete(roomId);
+
+                Metrics.userLeave(roomId, socket.userId);
+
+                const roomSize = getLocalRoomSize(io, roomId);
+                console.log('[syncGateway] user_left_room', {
+                    requestId: getRequestId(),
+                    socketId: socket.id,
+                    roomId,
+                    userId: socket.userId,
+                    roomSize,
+                });
+
+                io.to(channel).emit('roomUserLeave', {
+                    roomId,
+                    userId: socket.userId,
+                });
+
+                cleanupRoomIfEmpty(roomId);
+            }),
+        );
+
+        socket.on(
+            'heartbeat',
+            withWsRequestId(({ roomId } = {}) => {
+                if (!isValidRoomId(roomId)) {
+                    return;
+                }
+
+                ensureRoomActive(roomId);
+                socket.emit('heartbeatAck', {
+                    roomId,
+                    serverTimeMs: Date.now(),
+                });
+            }),
+        );
+
+        socket.on(
+            'driftReport',
+            withWsRequestId((payload = {}) => {
+                handleDriftReport(socket, payload).catch((error) => {
+                    console.error('[syncGateway] drift_report_error', {
+                        requestId: getRequestId(),
+                        socketId: socket.id,
+                        userId: socket.userId,
+                        error: error.message,
+                    });
+                });
+            }),
+        );
+
+        // PLAY
+        socket.on(
+            'play',
+            withWsRequestId(
+                async ({ roomId, trackId, startPositionMs } = {}) => {
+                    await handleControlCommand({
+                        action: 'play',
+                        socket,
+                        roomId,
+                        payloadValidator: () =>
+                            isValidRoomId(roomId) &&
+                            typeof trackId === 'string' &&
+                            trackId.trim().length > 0,
+                        domainCall: (userId) =>
+                            SyncDomainService.play({
+                                roomId,
+                                userId,
+                                trackId: trackId.trim(),
+                                startPositionMs:
+                                    typeof startPositionMs === 'number'
+                                        ? startPositionMs
+                                        : 0,
+                            }),
+                    });
+                },
+            ),
+        );
+
+        // PAUSE
+        socket.on(
+            'pause',
+            withWsRequestId(async ({ roomId } = {}) => {
+                await handleControlCommand({
+                    action: 'pause',
+                    socket,
+                    roomId,
+                    payloadValidator: () => isValidRoomId(roomId),
+                    domainCall: (userId) =>
+                        SyncDomainService.pause({
                             roomId,
-                            userId: socket.userId,
-                            err,
-                        });
+                            userId,
+                        }),
+                });
+            }),
+        );
+
+        // SEEK
+        socket.on(
+            'seek',
+            withWsRequestId(async ({ roomId, positionMs } = {}) => {
+                await handleControlCommand({
+                    action: 'seek',
+                    socket,
+                    roomId,
+                    payloadValidator: () =>
+                        isValidRoomId(roomId) &&
+                        typeof positionMs === 'number' &&
+                        Number.isFinite(positionMs) &&
+                        positionMs >= 0,
+                    domainCall: (userId) =>
+                        SyncDomainService.seek({
+                            roomId,
+                            userId,
+                            positionMs,
+                        }),
+                });
+            }),
+        );
+
+        // CHANGE TRACK
+        socket.on(
+            'changeTrack',
+            withWsRequestId(
+                async ({ roomId, trackId, startPositionMs } = {}) => {
+                    await handleControlCommand({
+                        action: 'changeTrack',
+                        socket,
+                        roomId,
+                        payloadValidator: () =>
+                            isValidRoomId(roomId) &&
+                            typeof trackId === 'string' &&
+                            trackId.trim().length > 0,
+                        domainCall: (userId) =>
+                            SyncDomainService.changeTrack({
+                                roomId,
+                                userId,
+                                trackId: trackId.trim(),
+                                startPositionMs:
+                                    typeof startPositionMs === 'number'
+                                        ? startPositionMs
+                                        : 0,
+                            }),
+                    });
+                },
+            ),
+        );
+
+        socket.on(
+            'disconnect',
+            withWsRequestId(async () => {
+                const rooms = Array.from(socket.joinedRooms);
+
+                console.log('[syncGateway] user_disconnected', {
+                    requestId: getRequestId(),
+                    socketId: socket.id,
+                    userId: socket.userId,
+                    roomCount: rooms.length,
+                });
+
+                for (const roomId of rooms) {
+                    Metrics.userLeave(roomId, socket.userId);
+                    io.to(roomChannel(roomId)).emit('roomUserLeave', {
+                        roomId,
+                        userId: socket.userId,
+                    });
+                    const localSize = getLocalRoomSize(io, roomId);
+                    if (!localSize) {
+                        cleanupRoomIfEmpty(roomId);
+                        // 👇 OJO:
+                        // Antes aquí se llamaba AuthService.maybeReleaseHost(...)
+                        // Ahora el "host" lo maneja room_members en queue-service,
+                        // así que esa lógica ya no vive en el sync-service.
                     }
                 }
-            }
 
-            socket.joinedRooms.clear();
-        }));
+                socket.joinedRooms.clear();
+            }),
+        );
     };
 
     const initialize = async () => {
@@ -473,23 +585,38 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     subClient.isOpen ? Promise.resolve() : subClient.connect(),
                 ]),
                 new Promise((_, reject) =>
-                    setTimeout(() => reject(new Error('Redis connection timeout (10s)')), 10000)
+                    setTimeout(
+                        () =>
+                            reject(
+                                new Error('Redis connection timeout (10s)'),
+                            ),
+                        10000,
+                    ),
                 ),
             ]);
 
             // Initialize Redis adapter for multi-instance Socket.IO synchronization
             io.adapter(createAdapter(pubClient, subClient));
-            console.log('[syncGateway] Redis adapter initialized for multi-instance deployment');
+            console.log(
+                '[syncGateway] Redis adapter initialized for multi-instance deployment',
+            );
         } catch (error) {
-            console.error('[syncGateway] Redis adapter initialization failed', {
-                error: error.message,
-            });
+            console.error(
+                '[syncGateway] Redis adapter initialization failed',
+                {
+                    error: error.message,
+                },
+            );
 
             // NOTE: In single-node mode, Socket.IO can run without Redis adapter
             // Set ALLOW_SINGLE_NODE=true for development or single-instance deployments
             if (process.env.ALLOW_SINGLE_NODE === 'true') {
-                console.warn('[syncGateway] Running in SINGLE-NODE mode (no Redis adapter)');
-                console.warn('[syncGateway] Multi-instance deployment will NOT work correctly');
+                console.warn(
+                    '[syncGateway] Running in SINGLE-NODE mode (no Redis adapter)',
+                );
+                console.warn(
+                    '[syncGateway] Multi-instance deployment will NOT work correctly',
+                );
             } else {
                 throw error;
             }
@@ -517,7 +644,10 @@ export function initSyncGateway(httpServer, { cors } = {}) {
 
         if (controlUnsubscribe) {
             await controlUnsubscribe().catch((error) => {
-                console.warn('Failed to unsubscribe control listener', error);
+                console.warn(
+                    'Failed to unsubscribe control listener',
+                    error,
+                );
             });
             controlUnsubscribe = null;
         }
