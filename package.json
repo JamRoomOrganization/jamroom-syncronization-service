@@ -1,12 +1,16 @@
 {
   "name": "jamroom-syncronization-service",
   "version": "1.0.0",
-  "description": "Backend for syncronization service",
+  "description": "Backend for synchronization service",
+  "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --experimental-vm-modules --experimental-loader=./jest-esm-loader.js ./node_modules/jest/bin/jest.js",
     "start": "node src/server.js",
-    "dev": "nodemon src/server.js"
+    "dev": "nodemon --exec \"node -r dotenv/config src/server.js dotenv_config_path=.env.local\"",
+    "dev:railway": "nodemon src/server.js",
+    "test:valkey": "node src/testValkey.js",
+    "test:redis": "node src/testRedis.js"
   },
   "repository": {
     "type": "git",
@@ -20,13 +24,18 @@
   },
   "homepage": "https://github.com/JamRoomOrganization/jamroom-syncronization-service#readme",
   "dependencies": {
+    "@socket.io/redis-adapter": "^8.2.1",
+    "axios": "^1.13.2",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "redis": "^5.9.0",
+    "redlock": "^5.0.0-beta.2",
     "socket.io": "^4.8.1"
   },
   "devDependencies": {
+    "express-list-endpoints": "^7.1.1",
+    "jest": "^30.2.0",
     "nodemon": "^3.1.10"
   }
 }

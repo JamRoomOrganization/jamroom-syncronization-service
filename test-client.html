@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>JamRoom Sync Test Client</title>
+    <style>
+        body {
+            font-family: system-ui, sans-serif;
+            background: #0f172a;
+            color: #f8fafc;
+            padding: 16px;
+            line-height: 1.4;
+        }
+        .row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        .card {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 16px;
+            min-width: 260px;
+            box-shadow: 0 16px 40px rgba(0, 0, 0, 0.4);
+        }
+        button {
+            cursor: pointer;
+            background: #3b82f6;
+            border: 0;
+            border-radius: 8px;
+            color: white;
+            padding: 8px 12px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        button.danger {
+            background: #ef4444;
+        }
+        input,
+        select {
+            background: #334155;
+            color: #f8fafc;
+            border: 1px solid #475569;
+            padding: 6px 8px;
+            border-radius: 6px;
+            font-size: 14px;
+            width: 100%;
+        }
+        label {
+            font-size: 12px;
+            color: #94a3b8;
+            display: block;
+            margin-bottom: 4px;
+        }
+        .mono {
+            font-family: ui-monospace, SFMono-Regular, monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+        .flexcol {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            width: 100%;
+        }
+    </style>
+</head>
+<body>
+<h1>JamRoom Sync Test Client</h1>
+<p style="color: #94a3b8; font-size: 14px">
+    Abre esta página en dos pestañas con diferente userId y la misma roomId.<br />
+    Una pestaña será el host (DJ), la otra será listener.<br />
+    Haz Play/Pause/Seek en el host y escucha si suena sincronizado.
+</p>
+
+<div class="row">
+    <div class="card">
+        <div class="flexcol">
+            <div>
+                <label>Sync Service Base URL (sin slash final)</label>
+                <input id="baseUrl" value="http://localhost:3001" />
+            </div>
+            <div>
+                <label>Room ID</label>
+                <input id="roomId" value="room1" />
+            </div>
+            <div>
+                <label>Your userId (cámbialo por dj123 / listener456 / etc)</label>
+                <input id="userId" value="dj123" />
+            </div>
+            <div>
+                <<label for="trackUrl">Audius Track Stream URL</label>
+                <input
+                        id="trackUrl"
+                        value="https://audio-ak.spotifycdn.com/audio/0acd8c2b0fac426af122f291b7c564c056afc811?__token__=exp=1763309139~hmac=667f7c9b0df9d0cf732f6cd6682f73fe7e0c164219a57e3e48c3a852930b7b14"
+                />
+
+            </div>
+            <div>
+                <button id="connectBtn">Connect & Join Room</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="flexcol">
+            <audio id="player" controls crossorigin="anonymous"></audio>
+
+            <div class="row" style="gap: 8px">
+                <button id="btnPlay">Play</button>
+                <button id="btnRestart">Restart (0:00)</button>
+                <button id="btnPause" class="danger">Pause</button>
+                <button id="btnSeekBack">&laquo; -10s</button>
+                <button id="btnSeekFwd">+10s &raquo;</button>
+            </div>
+
+            <div class="flexcol">
+                <label>Change Track (DJ only)</label>
+                <input id="newTrackId" placeholder="new-track-id..." />
+                <button id="btnChangeTrack">Change Track</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="card" style="flex: 1; min-width: 300px">
+        <div class="flexcol">
+            <label>Debug / State</label>
+            <pre
+                    id="debugBox"
+                    class="mono"
+                    style="
+              min-height: 200px;
+              background: #0f172a;
+              padding: 8px;
+              border-radius: 8px;
+              border: 1px solid #475569;
+              overflow: auto;
+            "
+            >not connected</pre>
+        </div>
+    </div>
+</div>
+
+<script
+        src="https://cdn.socket.io/4.7.5/socket.io.min.js"
+        crossorigin="anonymous"
+></script>
+
+<script>
+    // --- Estado local ---
+    let socket = null;
+    let lastSyncPacket = null;
+    let lastHeartbeatServerTime = null;
+    let lastHeartbeatLocalTime = null;
+    let lagSamples = []; // jitter calc
+    let driftIntervalHandle = null;
+    let isConnected = false;
+
+    // bandera para "ya me alineé inicial con el DJ"
+    let isReadyForSync = false;
+    // si llegan seeks ANTES de que terminemos el bootstrap inicial, los guardamos
+    let pendingSeek = null;
+
+    // DOM refs
+    const baseUrlEl = document.getElementById("baseUrl");
+    const roomIdEl = document.getElementById("roomId");
+    const userIdEl = document.getElementById("userId");
+    const trackUrlEl = document.getElementById("trackUrl");
+
+    const player = document.getElementById("player");
+    const debugBox = document.getElementById("debugBox");
+
+    const connectBtn = document.getElementById("connectBtn");
+    const btnPlay = document.getElementById("btnPlay");
+    const btnRestart = document.getElementById("btnRestart");
+    const btnPause = document.getElementById("btnPause");
+    const btnSeekBack = document.getElementById("btnSeekBack");
+    const btnSeekFwd = document.getElementById("btnSeekFwd");
+    const btnChangeTrack = document.getElementById("btnChangeTrack");
+    const newTrackIdEl = document.getElementById("newTrackId");
+
+    // util debug
+    function logDebug(obj) {
+        debugBox.textContent = JSON.stringify(obj, null, 2);
+    }
+
+    // medir lag/jitter
+    function estimateLagAndJitter(serverTimeMs) {
+        const nowLocal = Date.now();
+        const sample = nowLocal - serverTimeMs;
+        lagSamples.push(sample);
+        if (lagSamples.length > 20) lagSamples.shift();
+
+        const avg =
+            lagSamples.reduce((a, b) => a + b, 0) / lagSamples.length;
+        const variance =
+            lagSamples.reduce((a, b) => a + Math.pow(b - avg, 2), 0) /
+            lagSamples.length;
+        const jitter = Math.sqrt(variance);
+
+        return {
+            clientLagMs: Math.round(avg),
+            jitterMs: Math.round(jitter),
+        };
+    }
+
+    // main connect flow
+    async function connectAndJoin() {
+        const baseUrl = baseUrlEl.value.trim();
+        const roomId = roomIdEl.value.trim();
+        const userId = userIdEl.value.trim();
+        const trackUrl = trackUrlEl.value.trim();
+
+        if (!baseUrl || !roomId || !userId || !trackUrl) {
+            alert("Campos requeridos: baseUrl, roomId, userId, trackUrl");
+            return;
+        }
+
+        // 1. arranca el <audio> con la URL actual del input (DJ usa esto como pista actual)
+        player.src = trackUrl;
+        player.playbackRate = 1.0;
+
+        // 2. obtener snapshot inicial via REST (late join sync)
+        let initialState = null;
+        try {
+            const r = await fetch(
+                `${baseUrl}/v1/rooms/${encodeURIComponent(roomId)}/state`
+            );
+            if (r.ok) {
+                initialState = await r.json();
+            }
+        } catch (e) {
+            console.warn("error fetching initial state", e);
+        }
+
+        // 3. conectar socket (permitir polling fallback para que conecte en local)
+        socket = io(baseUrl, {
+            auth: {
+                userId, // TODO prod: JWT aquí
+            },
+        });
+
+        wireSocketHandlers(baseUrl, roomId, userId);
+
+        socket.on("connect", async () => {
+            isConnected = true;
+
+            // unirse a la sala lógica para recibir syncPacket
+            socket.emit("joinRoom", { roomId });
+
+            // si había reproducción activa, alinear "lo mejor posible" desde el start
+            if (initialState && initialState.playbackState === "playing") {
+                const expectedPos = initialState.effectivePositionMs;
+                player.currentTime = expectedPos / 1000;
+                try {
+                    await player.play();
+                } catch (e) {
+                    // puede bloquearse por autoplay, normal
+                }
+            }
+
+            // loop que reporta drift
+            startDriftLoop(roomId);
+        });
+    }
+
+    function wireSocketHandlers(baseUrl, roomId, userId) {
+        // heartbeatAck -> mide latencia cliente-servidor
+        socket.on("heartbeatAck", ({ serverTimeMs }) => {
+            const stats = estimateLagAndJitter(serverTimeMs);
+            lastHeartbeatServerTime = serverTimeMs;
+            lastHeartbeatLocalTime = Date.now();
+            logDebug({
+                info: "heartbeatAck",
+                serverTimeMs,
+                stats,
+            });
+        });
+
+        // syncPacket -> snapshot autoritativo ~1 vez/seg
+        socket.on("syncPacket", async (pkt) => {
+            // pkt: { roomId, serverTimeMs, trackId, playbackState, positionMs, version }
+            lastSyncPacket = pkt;
+
+            if (!isReadyForSync) {
+                // PRIMER sync para este tab
+                // 1. si cambió la pista, cámbiala
+                if (pkt.trackId && pkt.trackId !== player.src) {
+                    player.src = pkt.trackId;
+                }
+
+                // 2. fuerza mi currentTime al que manda el server
+                if (typeof pkt.positionMs === "number") {
+                    player.currentTime = pkt.positionMs / 1000;
+                }
+
+                // 3. si la sala está en "playing", intenta reproducir
+                if (pkt.playbackState === "playing") {
+                    try { await player.play(); } catch (e) {}
+                }
+
+                // 4. marca que ya quedé alineado
+                isReadyForSync = true;
+
+                // 5. si me habían mandado un seek antes de estar listo, aplícalo ahora
+                if (pendingSeek && typeof pendingSeek.positionMs === "number") {
+                    player.currentTime = pendingSeek.positionMs / 1000;
+                    pendingSeek = null;
+                }
+
+            } else {
+                // sync subsecuentes (estamos activos ya)
+                // Snap rápido si me estoy desviando mucho (>200ms)
+                if (
+                    pkt.playbackState === "playing" &&
+                    typeof pkt.positionMs === "number"
+                ) {
+                    const driftMs = Math.abs(
+                        player.currentTime * 1000 - pkt.positionMs
+                    );
+                    if (driftMs > 200) {
+                        player.currentTime = pkt.positionMs / 1000;
+                    }
+                }
+
+                // si el DJ cambió de track, cámbialo también aquí
+                if (pkt.trackId && pkt.trackId !== player.src) {
+                    player.src = pkt.trackId;
+                    if (typeof pkt.positionMs === "number") {
+                        player.currentTime = pkt.positionMs / 1000;
+                    }
+                    if (pkt.playbackState === "playing") {
+                        try { await player.play(); } catch (e) {}
+                    }
+                }
+            }
+
+            logDebug({
+                info: "syncPacket",
+                pkt,
+                localTimeMs: player.currentTime * 1000,
+            });
+
+            // si el server dice "paused", pausa local
+            if (pkt.playbackState === "paused") {
+                player.pause();
+            }
+
+            // si el server dice "playing" pero local estoy pausado, intenta play
+            if (pkt.playbackState === "playing" && player.paused) {
+                player.play().catch(() => {});
+            }
+        });
+
+        // avisos de control broadcast
+        socket.on("play", (msg) => {
+            // { trackId, startPositionMs, ... }
+            player.play().catch(() => {});
+            logDebug({ info: "broadcast:play", msg });
+        });
+
+        socket.on("pause", (msg) => {
+            player.pause();
+            logDebug({ info: "broadcast:pause", msg });
+        });
+
+        socket.on("seek", (msg) => {
+            // { positionMs, serverTimeMs, version }
+            if (!isReadyForSync) {
+                // aún no hice el primer syncPacket estable
+                pendingSeek = msg;
+            } else if (typeof msg.positionMs === "number") {
+                player.currentTime = msg.positionMs / 1000;
+            }
+            logDebug({
+                info: "broadcast:seek",
+                msg,
+                localCurrentTimeMs: player.currentTime * 1000,
+            });
+        });
+
+        socket.on("trackChanged", (msg) => {
+            logDebug({ info: "broadcast:trackChanged", msg });
+        });
+
+        socket.on("rateAdjust", ({ playbackRate, durationMs, reason }) => {
+            if (!isReadyForSync) return;
+            const originalRate = player.playbackRate;
+            player.playbackRate = playbackRate;
+
+            logDebug({
+                info: "rateAdjust",
+                playbackRate,
+                durationMs,
+                reason,
+                before: originalRate,
+            });
+
+            setTimeout(() => {
+                player.playbackRate = 1.0;
+            }, durationMs || 2000);
+        });
+
+        socket.on("controlAck", (msg) => {
+            logDebug({ info: "controlAck", msg });
+        });
+
+        socket.on("controlError", (msg) => {
+            console.warn("controlError", msg);
+            logDebug({ info: "controlError", msg });
+        });
+
+        socket.on("disconnect", () => {
+            isConnected = false;
+            stopDriftLoop();
+            logDebug({ info: "disconnect" });
+        });
+    }
+
+    function startDriftLoop(roomId) {
+        stopDriftLoop();
+        driftIntervalHandle = setInterval(() => {
+            if (!socket || !isConnected) return;
+            if (!lastSyncPacket) return;
+
+            const { clientLagMs, jitterMs } = estimateLagAndJitter(
+                lastHeartbeatServerTime || Date.now()
+            );
+
+            const localPositionMs = player.currentTime * 1000;
+
+            socket.emit("driftReport", {
+                roomId,
+                clientTimeMs: Date.now(),
+                localPositionMs,
+                observedServerTimeMs: lastSyncPacket.serverTimeMs,
+                observedServerPositionMs: lastSyncPacket.positionMs,
+                clientLagMs,
+                jitterMs,
+            });
+        }, 1000);
+    }
+
+    function stopDriftLoop() {
+        if (driftIntervalHandle) {
+            clearInterval(driftIntervalHandle);
+            driftIntervalHandle = null;
+        }
+    }
+
+
+    // Play ( desde la posición actual)
+    btnPlay.addEventListener("click", () => {
+        if (!socket || !isConnected) return;
+        const roomId = roomIdEl.value.trim();
+        const trackUrl = trackUrlEl.value.trim();
+
+        const startPosMs =
+            Math.floor(player.currentTime * 1000) || 0;
+
+        socket.emit("play", {
+            roomId,
+            trackId: trackUrl, // seguimos usando la URL directa como "trackId" en la demo
+            startPositionMs: startPosMs,
+        });
+    });
+
+    // Restart (forzar 0:00 para toda la sala)
+    btnRestart.addEventListener("click", () => {
+        if (!socket || !isConnected) return;
+        const roomId = roomIdEl.value.trim();
+        const trackUrl = trackUrlEl.value.trim();
+
+        socket.emit("play", {
+            roomId,
+            trackId: trackUrl,
+            startPositionMs: 0, // siempre reinicia la canción
+        });
+    });
+
+    // Pause
+    btnPause.addEventListener("click", () => {
+        if (!socket || !isConnected) return;
+        const roomId = roomIdEl.value.trim();
+        socket.emit("pause", { roomId });
+    });
+
+    // Rewind (-10s)
+    btnSeekBack.addEventListener("click", () => {
+        if (!socket || !isConnected) return;
+        const roomId = roomIdEl.value.trim();
+
+        const newPosMsRaw = player.currentTime * 1000 - 10000;
+        const newPosMs = newPosMsRaw < 0 ? 0 : newPosMsRaw;
+
+        socket.emit("seek", {
+            roomId,
+            positionMs: Math.floor(newPosMs),
+        });
+    });
+
+    // Forward (+10s)
+    btnSeekFwd.addEventListener("click", () => {
+        if (!socket || !isConnected) return;
+        const roomId = roomIdEl.value.trim();
+        const newPosMs = player.currentTime * 1000 + 10000;
+        socket.emit("seek", {
+            roomId,
+            positionMs: Math.floor(newPosMs),
+        });
+    });
+
+    // Change Track
+    btnChangeTrack.addEventListener("click", () => {
+        if (!socket || !isConnected) return;
+        const roomId = roomIdEl.value.trim();
+        const newTrackId = newTrackIdEl.value.trim();
+        socket.emit("changeTrack", {
+            roomId,
+            trackId: newTrackId || "demo-track-id",
+            startPositionMs: 0,
+        });
+    });
+
+    // Connect
+    connectBtn.addEventListener("click", () => {
+        connectAndJoin();
+    });
+</script>
+</body>
+</html>
