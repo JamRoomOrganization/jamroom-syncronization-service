@@ -4,18 +4,19 @@ import Redlock from 'redlock';
 import dotenv from 'dotenv';
 dotenv.config();
 
-// NOTE: Redis configuration supports multiple deployment modes:
-// - standalone: single Redis instance (dev/staging)
-// - sentinel: Redis Sentinel for HA (recommended for production)
-// - cluster: Redis Cluster for horizontal scaling (large deployments)
-// - nodes: multiple independent Redis nodes for Redlock quorum (ElastiCache Valkey)
-
 const REDIS_MODE = process.env.REDIS_MODE || 'standalone'; // standalone | sentinel | cluster | nodes
-const REDIS_URL = process.env.REDIS_URL; // No default - must be provided explicitly
-const REDIS_HOST = process.env.REDIS_HOST || '127.0.0.1';
-const REDIS_PORT = parseInt(process.env.REDIS_PORT || '6379', 10);
+
+const RAILWAY_REDIS_URL = process.env.RAILWAY_REDIS_URL || process.env.REDIS_PUBLIC_URL;
+const RAILWAY_REDIS_HOST = process.env.RAILWAY_REDIS_HOST;
+const RAILWAY_REDIS_PORT = process.env.RAILWAY_REDIS_PORT;
+const RAILWAY_REDIS_PASSWORD = process.env.RAILWAY_REDIS_PASSWORD;
+
+const REDIS_URL = RAILWAY_REDIS_URL || process.env.REDIS_URL; // Prefer public Railway URL when present
+const REDIS_HOST = RAILWAY_REDIS_HOST || process.env.REDIS_HOST || '127.0.0.1';
+const REDIS_PORT = parseInt(RAILWAY_REDIS_PORT || process.env.REDIS_PORT || '6379', 10);
 const REDIS_TLS = process.env.REDIS_TLS === 'true';
-const REDIS_PASSWORD = process.env.REDIS_PASSWORD || undefined;
+const REDIS_PASSWORD = RAILWAY_REDIS_PASSWORD || process.env.REDIS_PASSWORD || undefined;
+
 
 // Multi-node configuration (for Redlock with ElastiCache Valkey or similar)
 // Format: "host1:port1,host2:port2,host3:port3"
