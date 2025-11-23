@@ -1,51 +1,8 @@
-import axios from 'axios';
-
-
-const RAW_BASE_URL = process.env.QUEUE_SERVICE_URL || 'http://localhost:3000';
-const BASE_URL = RAW_BASE_URL.replace(/\/+$/, '');
+import queueClient from '../lib/queueClient.js';
 
 // Timeout duro en ms para no colgar el sync-service si Railway se demora
 const DEFAULT_TIMEOUT_MS = 3000;
 
-/**
- * Pequeño wrapper para hacer requests al queue-service
- * con Authorization: Bearer <accessToken>.
- *
- * NO lanza por status HTTP (usa validateStatus), pero
- * SÍ lanza si hay error de red / timeout.
- */
-async function queueRequest({ method, path, accessToken, data }) {
-    const url = `${BASE_URL}${path}`;
-    const headers = {};
-
-    if (accessToken) {
-        headers.Authorization = `Bearer ${accessToken}`;
-    }
-
-    try {
-        const res = await axios({
-            method,
-            url,
-            headers,
-            data,
-            timeout: DEFAULT_TIMEOUT_MS,
-            // Dejamos que el caller decida si status es "éxito" o no
-            validateStatus: () => true,
-        });
-
-        return res;
-    } catch (err) {
-        // Errores de red / timeout / DNS
-        // Importante: preservar err.code para que AuthService lo pueda mapear.
-        console.error('[queueMembershipClient] network error', {
-            url,
-            method,
-            code: err.code,
-            message: err.message,
-        });
-        throw err;
-    }
-}
 
 /**
  * Obtiene la membresía del usuario autenticado (via accessToken)
@@ -69,10 +26,9 @@ async function getMyMembership({ roomId, accessToken }) {
 
     const path = `/api/rooms/${encodeURIComponent(roomId)}/members/me`;
 
-    const res = await queueRequest({
-        method: 'get',
-        path,
+    const res = await queueClient.get(path, {
         accessToken,
+        timeout: DEFAULT_TIMEOUT_MS,
     });
 
     if (res.status >= 200 && res.status < 300) {
@@ -117,11 +73,9 @@ async function ensureMyMembership({ roomId, accessToken }) {
 
     const path = `/api/rooms/${encodeURIComponent(roomId)}/members/ensure`;
 
-    const res = await queueRequest({
-        method: 'post',
-        path,
+    const res = await queueClient.post(path, {}, {
         accessToken,
-        data: {}, // body vacío
+        timeout: DEFAULT_TIMEOUT_MS,
     });
 
     if (res.status >= 200 && res.status < 300) {
