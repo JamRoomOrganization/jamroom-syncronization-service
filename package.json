@@ -11,6 +11,7 @@
     "dev:railway": "nodemon src/server.js",
     "test:valkey": "node src/testValkey.js",
     "test:redis": "node src/testRedis.js",
+    "test:queue": "node src/testQueueClient.js",
     "setup:railway": "node scripts/setup-railway.js",
     "railway:logs": "railway logs",
     "railway:vars": "railway variables"

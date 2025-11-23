@@ -54,6 +54,10 @@ spec:
         - name: PORT
           value: "3001"
 
+        # Queue Service URL
+        - name: QUEUE_SERVICE_URL
+          value: "http://jamroom-queue-service:3000"
+
         # CORS configuration
         - name: ALLOWED_ORIGINS
           value: "https://yourapp.com,https://www.yourapp.com"
