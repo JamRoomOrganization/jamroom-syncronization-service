@@ -376,10 +376,28 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     roomSize,
                 });
 
-                io.to(channel).emit('roomUserJoin', {
-                    roomId,
-                    userId: socket.userId,
-                });
+                // ✅ Manejo robusto de emisión con pubClient
+                try {
+                    io.to(channel).emit('roomUserJoin', {
+                        roomId,
+                        userId: socket.userId,
+                    });
+                } catch (emitError) {
+                    console.warn('[syncGateway] failed to emit roomUserJoin', {
+                        requestId: getRequestId(),
+                        roomId,
+                        userId: socket.userId,
+                        error: emitError.message,
+                        // ⚠️ Si pubClient está cerrado, el evento NO se sincroniza entre instancias
+                        // pero el usuario actual SÍ recibe la confirmación local
+                    });
+
+                    // Fallback: emitir solo al socket actual (sin Redis)
+                    socket.emit('roomUserJoin', {
+                        roomId,
+                        userId: socket.userId,
+                    });
+                }
             }),
         );
 
@@ -406,10 +424,20 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     roomSize,
                 });
 
-                io.to(channel).emit('roomUserLeave', {
-                    roomId,
-                    userId: socket.userId,
-                });
+                // ✅ Manejo robusto de emisión
+                try {
+                    io.to(channel).emit('roomUserLeave', {
+                        roomId,
+                        userId: socket.userId,
+                    });
+                } catch (emitError) {
+                    console.warn('[syncGateway] failed to emit roomUserLeave', {
+                        requestId: getRequestId(),
+                        roomId,
+                        userId: socket.userId,
+                        error: emitError.message,
+                    });
+                }
 
                 cleanupRoomIfEmpty(roomId);
             }),
@@ -555,10 +583,22 @@ export function initSyncGateway(httpServer, { cors } = {}) {
 
                 for (const roomId of rooms) {
                     Metrics.userLeave(roomId, socket.userId);
-                    io.to(roomChannel(roomId)).emit('roomUserLeave', {
-                        roomId,
-                        userId: socket.userId,
-                    });
+
+                    // ✅ Manejo robusto de emisión en disconnect
+                    try {
+                        io.to(roomChannel(roomId)).emit('roomUserLeave', {
+                            roomId,
+                            userId: socket.userId,
+                        });
+                    } catch (emitError) {
+                        console.warn('[syncGateway] failed to emit roomUserLeave on disconnect', {
+                            requestId: getRequestId(),
+                            roomId,
+                            userId: socket.userId,
+                            error: emitError.message,
+                        });
+                    }
+
                     const localSize = getLocalRoomSize(io, roomId);
                     if (!localSize) {
                         cleanupRoomIfEmpty(roomId);

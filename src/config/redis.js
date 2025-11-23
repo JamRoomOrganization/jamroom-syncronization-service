@@ -64,13 +64,15 @@ validateRedisConfig();
 // NOTE: Common socket options for resilience in production
 const socketOptions = {
   connectTimeout: 10000, // 10s connection timeout
+  keepAlive: 5000, // ✅ Mantener conexión viva cada 5s
   reconnectStrategy: (retries) => {
     if (retries > 10) {
       console.error('[redis] Max reconnect attempts reached (10)');
       return new Error('Max reconnect attempts exceeded');
     }
-    const delay = Math.min(retries * 100, 3000); // Exponential backoff, cap at 3s
-    console.log(`[redis] Reconnecting in ${delay}ms (attempt ${retries})`);
+    // ✅ Backoff exponencial: 100ms, 200ms, 400ms, ..., max 3000ms
+    const delay = Math.min(100 * Math.pow(2, retries), 3000);
+    console.log(`[redis] Reconnecting in ${delay}ms (attempt ${retries + 1})`);
     return delay;
   },
   tls: REDIS_TLS,
@@ -180,22 +182,32 @@ redisClient.on('error', (err) => {
 redisClient.on('reconnecting', () => {
   console.warn('[redis] main reconnecting...');
 });
+redisClient.on('ready', () => {
+  console.log('[redis] main client ready');
+});
 
 // Clientes dedicados a pub/sub para el adapter de Socket.IO
 export const pubClient = createRedisClientForMode();
 pubClient.on('error', (err) => {
-  console.error('[redis] pub error', err.message);
+  console.error('[redis] pub client error', err.message);
+  // ⚠️ NO cerrar el cliente aquí, dejarlo reconectar solo
 });
 pubClient.on('reconnecting', () => {
-  console.warn('[redis] pub reconnecting...');
+  console.warn('[redis] pub client reconnecting...');
+});
+pubClient.on('ready', () => {
+  console.log('[redis] pub client ready');
 });
 
 export const subClient = createRedisClientForMode();
 subClient.on('error', (err) => {
-  console.error('[redis] sub error', err.message);
+  console.error('[redis] sub client error', err.message);
 });
 subClient.on('reconnecting', () => {
-  console.warn('[redis] sub reconnecting...');
+  console.warn('[redis] sub client reconnecting...');
+});
+subClient.on('ready', () => {
+  console.log('[redis] sub client ready');
 });
 
 // NOTE: Redlock configuration for distributed locks across Redis instances
