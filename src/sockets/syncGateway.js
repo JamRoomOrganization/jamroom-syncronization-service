@@ -12,6 +12,9 @@ import { pubClient, subClient } from '../config/redis.js';
 import { enforceRoomRateLimit } from '../utils/rateLimiter.js';
 import { withWsRequestId, getRequestId } from '../utils/requestLogger.js';
 
+// Si tienes un helper para parsear listas (opcional, si existe en tu código base)
+import { toArray } from '../utils/toArray.js';
+
 const CONTROL_CHANNEL_PATTERN = 'room:*:control';
 const roomChannel = (roomId) => `room:${roomId}`;
 
@@ -215,7 +218,22 @@ export async function handleDriftReport(socket, payload = {}) {
 }
 
 export function initSyncGateway(httpServer, { cors } = {}) {
-    const io = new SocketIOServer(httpServer, { cors });
+    // ✅ CORS por defecto para Socket.IO
+    const defaultCors = {
+        origin: toArray(process.env.CORS_ORIGIN) || '*',
+        methods: ['GET', 'POST'],
+        credentials: false, // CLAVE: no usamos cookies en el socket
+    };
+
+    // Mezclamos defaults con lo que (opcionalmente) venga desde start()
+    const finalCors = {
+        ...defaultCors,
+        ...(cors || {}),
+        // Forzamos siempre credentials: false para no romper con el front
+        credentials: false,
+    };
+
+    const io = new SocketIOServer(httpServer, { cors: finalCors });
     const activeRooms = new Set();
 
     let controlUnsubscribe = null;
