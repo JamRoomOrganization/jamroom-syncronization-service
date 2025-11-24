@@ -1,15 +1,19 @@
-import queueClient from '../lib/queueClient.js';
+// src/services/queueMembershipClient.js
+import axios from 'axios';
 
 // Timeout duro en ms para no colgar el sync-service si Railway se demora
 const DEFAULT_TIMEOUT_MS = 3000;
 
+const QUEUE_BASE_URL =
+    process.env.QUEUE_SERVICE_URL ||
+    'https://jamroom-queue-service-production.up.railway.app';
 
 /**
- * Obtiene la membresía del usuario autenticado (via accessToken)
- * en una sala dada: /api/rooms/:roomId/members/me
+ * Obtiene la membresía del usuario autenticado (via accessToken / jr_token)
+ * en una sala dada: GET /api/rooms/:roomId/members/me
  *
- * Retorna el JSON de membership si 2xx.
- * Si status no es 2xx → lanza Error con .response (para que AuthService lo mapee).
+ * Retorna el JSON de membership si status 2xx.
+ * Si status no es 2xx → lanza Error con err.response para que AuthService lo mapee.
  */
 async function getMyMembership({ roomId, accessToken }) {
     if (!roomId || typeof roomId !== 'string' || !roomId.trim()) {
@@ -24,32 +28,36 @@ async function getMyMembership({ roomId, accessToken }) {
         throw err;
     }
 
-    const path = `/api/rooms/${encodeURIComponent(roomId)}/members/me`;
-
-    const res = await queueClient.get(path, {
-        accessToken,
-        timeout: DEFAULT_TIMEOUT_MS,
-    });
-
-    if (res.status >= 200 && res.status < 300) {
-        return res.data;
-    }
-
-    // Construimos un error con contexto, pero MUY importante:
-    // adjuntar res en error.response para que AuthService pueda leer status y body.
-    const error = new Error(
-        `queueService getMyMembership failed with status ${res.status}`,
-    );
-    error.response = res;
-    error.code = 'QUEUE_SERVICE_HTTP_ERROR';
-
-    console.warn('[queueMembershipClient] getMyMembership non-2xx', {
+    const url = `${QUEUE_BASE_URL}/api/rooms/${encodeURIComponent(
         roomId,
-        status: res.status,
-        data: res.data,
-    });
+    )}/members/me`;
 
-    throw error;
+    try {
+        const res = await axios.get(url, {
+            headers: {
+                Authorization: `Bearer ${accessToken}`,
+            },
+            timeout: DEFAULT_TIMEOUT_MS,
+        });
+
+        return res.data;
+    } catch (error) {
+        if (error.response) {
+            console.warn('[queueMembershipClient] getMyMembership non-2xx', {
+                roomId,
+                status: error.response.status,
+                data: error.response.data,
+            });
+        } else {
+            console.warn('[queueMembershipClient] getMyMembership error', {
+                roomId,
+                message: error.message,
+            });
+        }
+
+        // Dejamos que AuthService haga el mapping
+        throw error;
+    }
 }
 
 /**
@@ -71,30 +79,39 @@ async function ensureMyMembership({ roomId, accessToken }) {
         throw err;
     }
 
-    const path = `/api/rooms/${encodeURIComponent(roomId)}/members/ensure`;
-
-    const res = await queueClient.post(path, {}, {
-        accessToken,
-        timeout: DEFAULT_TIMEOUT_MS,
-    });
-
-    if (res.status >= 200 && res.status < 300) {
-        return res.data;
-    }
-
-    const error = new Error(
-        `queueService ensureMyMembership failed with status ${res.status}`,
-    );
-    error.response = res;
-    error.code = 'QUEUE_SERVICE_HTTP_ERROR';
-
-    console.warn('[queueMembershipClient] ensureMyMembership non-2xx', {
+    const url = `${QUEUE_BASE_URL}/api/rooms/${encodeURIComponent(
         roomId,
-        status: res.status,
-        data: res.data,
-    });
+    )}/members/ensure`;
 
-    throw error;
+    try {
+        const res = await axios.post(
+            url,
+            {},
+            {
+                headers: {
+                    Authorization: `Bearer ${accessToken}`,
+                },
+                timeout: DEFAULT_TIMEOUT_MS,
+            },
+        );
+
+        return res.data;
+    } catch (error) {
+        if (error.response) {
+            console.warn('[queueMembershipClient] ensureMyMembership non-2xx', {
+                roomId,
+                status: error.response.status,
+                data: error.response.data,
+            });
+        } else {
+            console.warn('[queueMembershipClient] ensureMyMembership error', {
+                roomId,
+                message: error.message,
+            });
+        }
+
+        throw error;
+    }
 }
 
 export const queueMembershipClient = {

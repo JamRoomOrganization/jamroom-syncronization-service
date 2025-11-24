@@ -1,3 +1,4 @@
+// src/sockets/syncGateway.js
 import { Server as SocketIOServer } from 'socket.io';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { RedisService } from '../services/redisService.js';
@@ -11,8 +12,6 @@ import { Metrics } from '../utils/metrics.js';
 import { pubClient, subClient } from '../config/redis.js';
 import { enforceRoomRateLimit } from '../utils/rateLimiter.js';
 import { withWsRequestId, getRequestId } from '../utils/requestLogger.js';
-
-// Si tienes un helper para parsear listas (opcional, si existe en tu código base)
 import { toArray } from '../utils/toArray.js';
 
 const CONTROL_CHANNEL_PATTERN = 'room:*:control';
@@ -90,12 +89,15 @@ const handleControlCommand = async ({
 
     if (!socket.data?.accessToken && AUTH_BYPASS) {
         // Modo DEV: dejamos pasar, pero avisamos en logs
-        console.warn('[handleControlCommand] AUTH_BYPASS enabled, skipping permission check', {
-            action,
-            roomId,
-            socketId: socket.id,
-            userId: socket.userId,
-        });
+        console.warn(
+            '[handleControlCommand] AUTH_BYPASS enabled, skipping permission check',
+            {
+                action,
+                roomId,
+                socketId: socket.id,
+                userId: socket.userId,
+            },
+        );
     } else {
         try {
             const membership = await AuthService.ensureCanControlPlayback({
@@ -118,7 +120,12 @@ const handleControlCommand = async ({
             // Mapeo de códigos de error → mensajes simples para el cliente
             switch (err.code) {
                 case 'MEMBERSHIP_NOT_FOUND':
-                    emitControlError(socket, action, roomId, 'membership_not_found');
+                    emitControlError(
+                        socket,
+                        action,
+                        roomId,
+                        'membership_not_found',
+                    );
                     return;
                 case 'ROOM_CONTROL_FORBIDDEN':
                 case 'FORBIDDEN':
@@ -128,7 +135,12 @@ const handleControlCommand = async ({
                     emitControlError(socket, action, roomId, 'unauthorized');
                     return;
                 case 'QUEUE_SERVICE_UNAVAILABLE':
-                    emitControlError(socket, action, roomId, 'upstream_unavailable');
+                    emitControlError(
+                        socket,
+                        action,
+                        roomId,
+                        'upstream_unavailable',
+                    );
                     return;
                 default:
                     emitControlError(socket, action, roomId, 'internal_error');
@@ -222,14 +234,12 @@ export function initSyncGateway(httpServer, { cors } = {}) {
     const defaultCors = {
         origin: toArray(process.env.CORS_ORIGIN) || '*',
         methods: ['GET', 'POST'],
-        credentials: false, // CLAVE: no usamos cookies en el socket
+        credentials: false, // clave: no usamos cookies en el socket
     };
 
-    // Mezclamos defaults con lo que (opcionalmente) venga desde start()
     const finalCors = {
         ...defaultCors,
         ...(cors || {}),
-        // Forzamos siempre credentials: false para no romper con el front
         credentials: false,
     };
 
@@ -254,7 +264,6 @@ export function initSyncGateway(httpServer, { cors } = {}) {
         const localSize = getLocalRoomSize(io, roomId);
         if (localSize === 0) {
             activeRooms.delete(roomId);
-            // TODO: In clustered deployments query adapter state (e.g., allRooms) to confirm emptiness.
         }
     };
 
@@ -282,7 +291,6 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     RedisService.computeCurrentPosition(state, now),
                 );
 
-                // NOTE: syncPacket sent every 1s to all clients in room for drift correction
                 io.to(roomChannel(roomId)).emit('syncPacket', {
                     roomId,
                     serverTimeMs: now,
@@ -292,7 +300,6 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     version: state.version ?? 0,
                 });
 
-                // Log only when state changes or periodically (every 30s)
                 if (state.version % 30 === 0 || state.version < 3) {
                     console.log('[syncGateway] syncPacket', {
                         roomId,
@@ -302,7 +309,10 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     });
                 }
             } catch (error) {
-                console.error(`Failed to emit syncPacket for room ${roomId}`, error);
+                console.error(
+                    `Failed to emit syncPacket for room ${roomId}`,
+                    error,
+                );
             }
         }
     };
@@ -344,10 +354,11 @@ export function initSyncGateway(httpServer, { cors } = {}) {
 
     const registerSocketHandlers = (socket) => {
         // 🔐 Nuevo flujo de auth:
-        // - Tomamos accessToken del handshake (socket.handshake.auth.token)
+        // - Tomamos accessToken del handshake (socket.handshake.auth.token / accessToken)
         // - Lo usamos en AuthService.ensureCanControlPlayback (queue-service + Cognito)
         const rawAuth = socket.handshake.auth || {};
-        const accessToken = rawAuth.token || rawAuth.accessToken || null;
+        const accessToken =
+            rawAuth.token || rawAuth.accessToken || null;
 
         if (!accessToken && !AUTH_BYPASS) {
             console.warn('[syncGateway] missing token, disconnecting socket', {
@@ -394,23 +405,22 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     roomSize,
                 });
 
-                // ✅ Manejo robusto de emisión con pubClient
                 try {
                     io.to(channel).emit('roomUserJoin', {
                         roomId,
                         userId: socket.userId,
                     });
                 } catch (emitError) {
-                    console.warn('[syncGateway] failed to emit roomUserJoin', {
-                        requestId: getRequestId(),
-                        roomId,
-                        userId: socket.userId,
-                        error: emitError.message,
-                        // ⚠️ Si pubClient está cerrado, el evento NO se sincroniza entre instancias
-                        // pero el usuario actual SÍ recibe la confirmación local
-                    });
+                    console.warn(
+                        '[syncGateway] failed to emit roomUserJoin',
+                        {
+                            requestId: getRequestId(),
+                            roomId,
+                            userId: socket.userId,
+                            error: emitError.message,
+                        },
+                    );
 
-                    // Fallback: emitir solo al socket actual (sin Redis)
                     socket.emit('roomUserJoin', {
                         roomId,
                         userId: socket.userId,
@@ -442,19 +452,21 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     roomSize,
                 });
 
-                // ✅ Manejo robusto de emisión
                 try {
                     io.to(channel).emit('roomUserLeave', {
                         roomId,
                         userId: socket.userId,
                     });
                 } catch (emitError) {
-                    console.warn('[syncGateway] failed to emit roomUserLeave', {
-                        requestId: getRequestId(),
-                        roomId,
-                        userId: socket.userId,
-                        error: emitError.message,
-                    });
+                    console.warn(
+                        '[syncGateway] failed to emit roomUserLeave',
+                        {
+                            requestId: getRequestId(),
+                            roomId,
+                            userId: socket.userId,
+                            error: emitError.message,
+                        },
+                    );
                 }
 
                 cleanupRoomIfEmpty(roomId);
@@ -602,28 +614,26 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                 for (const roomId of rooms) {
                     Metrics.userLeave(roomId, socket.userId);
 
-                    // ✅ Manejo robusto de emisión en disconnect
                     try {
                         io.to(roomChannel(roomId)).emit('roomUserLeave', {
                             roomId,
                             userId: socket.userId,
                         });
                     } catch (emitError) {
-                        console.warn('[syncGateway] failed to emit roomUserLeave on disconnect', {
-                            requestId: getRequestId(),
-                            roomId,
-                            userId: socket.userId,
-                            error: emitError.message,
-                        });
+                        console.warn(
+                            '[syncGateway] failed to emit roomUserLeave on disconnect',
+                            {
+                                requestId: getRequestId(),
+                                roomId,
+                                userId: socket.userId,
+                                error: emitError.message,
+                            },
+                        );
                     }
 
                     const localSize = getLocalRoomSize(io, roomId);
                     if (!localSize) {
                         cleanupRoomIfEmpty(roomId);
-                        // 👇 OJO:
-                        // Antes aquí se llamaba AuthService.maybeReleaseHost(...)
-                        // Ahora el "host" lo maneja room_members en queue-service,
-                        // así que esa lógica ya no vive en el sync-service.
                     }
                 }
 
@@ -633,9 +643,6 @@ export function initSyncGateway(httpServer, { cors } = {}) {
     };
 
     const initialize = async () => {
-        // NOTE: Connect Redis pub/sub clients BEFORE initializing Socket.IO adapter
-        // This ensures adapter has working connections on multi-instance deployments
-        // Timeout prevents hanging on Redis unavailability
         try {
             await Promise.race([
                 Promise.all([
@@ -653,7 +660,6 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                 ),
             ]);
 
-            // Initialize Redis adapter for multi-instance Socket.IO synchronization
             io.adapter(createAdapter(pubClient, subClient));
             console.log(
                 '[syncGateway] Redis adapter initialized for multi-instance deployment',
@@ -666,8 +672,6 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                 },
             );
 
-            // NOTE: In single-node mode, Socket.IO can run without Redis adapter
-            // Set ALLOW_SINGLE_NODE=true for development or single-instance deployments
             if (process.env.ALLOW_SINGLE_NODE === 'true') {
                 console.warn(
                     '[syncGateway] Running in SINGLE-NODE mode (no Redis adapter)',

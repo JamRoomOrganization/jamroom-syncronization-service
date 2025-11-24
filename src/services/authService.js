@@ -1,8 +1,9 @@
+// src/services/authService.js
 import { RedisService } from './redisService.js';
 import { queueMembershipClient } from './queueMembershipClient.js';
 import { isSafeId } from '../utils/idValidator.js';
 
-// Cache en memoria de quién es host por roomId (para no ir a Redis en cada request)
+// Cache en memoria de quién es host por roomId (modo legacy basado en Redis)
 const hostCache = new Map();
 const HOST_CACHE_TTL_MS = 1000; // 1 segundo
 
@@ -14,7 +15,7 @@ class AuthError extends Error {
     }
 }
 
-// ---- utilidades de cache de host (modo actual Redis) ----
+// ---- utilidades de cache de host (modo actual Redis legacy) ----
 
 const cacheGet = (roomId) => {
     const entry = hostCache.get(roomId);
@@ -49,14 +50,14 @@ const fetchHostUserId = async (roomId) => {
 
 export const AuthService = {
     /**
-     * MODO ACTUAL (lo que ya tienes funcionando):
+     * MODO LEGACY (basado en Redis):
      *
      * Primer usuario que manda play/pause/seek/changeTrack en esa room
      * se convierte en host (se guarda en Redis). Luego sólo ese userId
      * puede controlar la sala.
      *
-     * Esto es lo que hoy usa syncGateway:
-     *   const canControl = await AuthService.canControlRoom(socket.userId, roomId);
+     * Esto se mantiene por compatibilidad, pero el flujo nuevo usa
+     * room_members + JWT vía ensureCanControlPlayback.
      */
     async canControlRoom(userId, roomId) {
         if (!isSafeId(userId) || !isSafeId(roomId)) {
@@ -90,6 +91,7 @@ export const AuthService = {
 
     /**
      * Se llama cuando un socket se desconecta y esa instancia podría liberar el host.
+     * (Sólo aplica al modo legacy basado en Redis).
      */
     async maybeReleaseHost(roomId, userId) {
         if (!isSafeId(roomId) || !isSafeId(userId)) {
@@ -108,9 +110,9 @@ export const AuthService = {
     },
 
     /**
+     * Flujo nuevo (el que nos interesa ahora):
      *
-     *
-     * Verifica que el usuario (a través de su accessToken) tenga permiso
+     * Verifica que el usuario (a través de su accessToken / jr_token) tenga permiso
      * para controlar la reproducción en una sala según `room_members` en
      * el queue-service.
      *
@@ -120,10 +122,6 @@ export const AuthService = {
      *
      * Retorna el registro de membership.
      * Lanza AuthError con .code y .status para que el caller lo mapee.
-     *
-     * NOTA: Por ahora esto NO lo está usando syncGateway,
-     * pero ya queda listo para integrarlo cuando pases el JWT
-     * en el handshake del socket.
      */
     async ensureCanControlPlayback({ accessToken, roomId }) {
         if (!isSafeId(roomId)) {
@@ -141,7 +139,7 @@ export const AuthService = {
                 accessToken,
             });
         } catch (err) {
-            // Mapeamos errores HTTP del queue-service
+            // Mapeamos errores HTTP del queue-service (axios-style)
             if (err.response) {
                 const { status, data } = err.response;
 
