@@ -362,6 +362,14 @@ export function initSyncGateway(httpServer, { cors } = {}) {
             // ✅ No enviar syncPacket si hay seek reciente (ventana de 2s)
             const lastSeek = recentSeeks.get(roomId);
             if (lastSeek && now - lastSeek < 2000) {
+                // ✅ Log solo en modo debug para no saturar logs
+                if (process.env.LOG_LEVEL === 'debug') {
+                    console.log('[syncGateway] syncPacket_skipped', {
+                        roomId,
+                        reason: 'recent_seek',
+                        timeSinceSeek: now - lastSeek,
+                    });
+                }
                 continue;
             }
 
@@ -647,19 +655,25 @@ export function initSyncGateway(httpServer, { cors } = {}) {
             withWsRequestId(({ clientTimestamp } = {}) => {
                 const serverTimestamp = Date.now();
 
+                // ✅ Calcular RTT aproximado
+                const rtt = serverTimestamp - clientTimestamp;
+
                 socket.emit('latencyResponse', {
                     clientTimestamp,
                     serverTimestamp,
                 });
 
-                // Logging solo en debug mode
-                if (process.env.LOG_LEVEL === 'debug') {
-                    console.log('[syncGateway] latency_measurement', {
+                // ✅ Logging solo en debug mode o si RTT es alto
+                if (process.env.LOG_LEVEL === 'debug' || rtt > 500) {
+                    const logLevel = rtt > 500 ? 'warn' : 'log';
+                    console[logLevel]('[syncGateway] latency_measurement', {
                         requestId: getRequestId(),
                         socketId: socket.id,
                         userId: socket.userId,
                         clientTimestamp,
                         serverTimestamp,
+                        rttMs: rtt,
+                        isHighLatency: rtt > 500,
                     });
                 }
             }),
