@@ -23,10 +23,10 @@ const isValidRoomId = (roomId) =>
 const AUTH_BYPASS = process.env.AUTH_BYPASS === 'true';
 
 const CONTROL_LIMITS = {
-    play: { max: 3, windowMs: 1000 },
-    pause: { max: 5, windowMs: 1000 },
-    seek: { max: 8, windowMs: 1000 },
-    changeTrack: { max: 3, windowMs: 1000 },
+    play: { max: 10, windowMs: 3000 },    // ✅ Reducido throttling para mejor UX
+    pause: { max: 10, windowMs: 3000 },   // ✅ Reducido throttling para mejor UX
+    seek: { max: 20, windowMs: 5000 },    // ✅ Mantener flexible
+    changeTrack: { max: 10, windowMs: 10000 },
 };
 
 const extractRoomIdFromChannel = (channel) => {
@@ -321,6 +321,9 @@ export function initSyncGateway(httpServer, { cors } = {}) {
     const io = new SocketIOServer(httpServer, { cors: finalCors });
     const activeRooms = new Set();
 
+    // ✅ OPTIMIZACIÓN: Map para trackear seeks recientes (ventana post-seek)
+    const recentSeeks = new Map(); // roomId -> timestamp
+
     let controlUnsubscribe = null;
     let syncInterval = null;
     let handlersRegistered = false;
@@ -348,10 +351,17 @@ export function initSyncGateway(httpServer, { cors } = {}) {
         }
 
         const now = Date.now();
+
         for (const roomId of Array.from(activeRooms)) {
             const localSize = getLocalRoomSize(io, roomId);
             if (!localSize) {
                 cleanupRoomIfEmpty(roomId);
+                continue;
+            }
+
+            // ✅ No enviar syncPacket si hay seek reciente (ventana de 2s)
+            const lastSeek = recentSeeks.get(roomId);
+            if (lastSeek && now - lastSeek < 2000) {
                 continue;
             }
 
@@ -363,14 +373,13 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                 }
 
                 // ✅ OPTIMIZACIÓN: Throttling basado en estado
-                // Solo enviar syncPacket si hay cambios relevantes o cada 5 segundos
                 const lastSync = state.lastSyncMs || 0;
                 const timeSinceLastSync = now - lastSync;
-                const SYNC_INTERVAL_MS = 5000;
+                const SYNC_INTERVAL_MS = parseInt(process.env.SYNC_INTERVAL_MS || '1000', 10);
 
                 const shouldSync =
                     state.playbackState === 'playing' || // Siempre sync si está reproduciendo
-                    timeSinceLastSync >= SYNC_INTERVAL_MS || // O cada 5s si pausado
+                    timeSinceLastSync >= SYNC_INTERVAL_MS * 5 || // O cada 5s si pausado
                     state.version <= 3; // O en las primeras sincronizaciones
 
                 if (!shouldSync) {
@@ -515,7 +524,7 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                 try {
                     const state = await RedisService.getRoomState(roomId);
 
-                    if (state) {
+                    if (state && state.trackId) {
                         const positionMs = Math.floor(
                             RedisService.computeCurrentPosition(state, now)
                         );
@@ -526,12 +535,8 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                             serverTimeMs: now,
                             playbackState: state.playbackState || 'paused',
                             positionMs,
-                            trackId: state.trackId ?? null,
+                            trackId: state.trackId,
                             version: state.version ?? 0,
-                            // Métricas para el cliente
-                            serverProcessingMs: clientJoinTimestamp
-                                ? now - clientJoinTimestamp
-                                : null,
                         });
 
                         console.log('[syncGateway] initialSync enviado', {
@@ -540,9 +545,7 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                             userId: socket.userId,
                             trackId: state.trackId,
                             positionMs,
-                            serverProcessingMs: clientJoinTimestamp
-                                ? now - clientJoinTimestamp
-                                : null,
+                            playbackState: state.playbackState,
                         });
                     }
                 } catch (error) {
@@ -735,12 +738,19 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                         typeof positionMs === 'number' &&
                         Number.isFinite(positionMs) &&
                         positionMs >= 0,
-                    domainCall: (userId) =>
-                        SyncDomainService.seek({
+                    domainCall: async (userId) => {
+                        // ✅ Marcar seek reciente para pausar syncPackets
+                        recentSeeks.set(roomId, Date.now());
+
+                        // Limpiar después de 2s
+                        setTimeout(() => recentSeeks.delete(roomId), 2000);
+
+                        return await SyncDomainService.seek({
                             roomId,
                             userId,
                             positionMs,
-                        }),
+                        });
+                    },
                 });
             }),
         );
