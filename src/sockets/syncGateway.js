@@ -65,6 +65,8 @@ const handleControlCommand = async ({
                                         payloadValidator,
                                         domainCall,
                                     }) => {
+    const startTime = Date.now(); // ✅ Métrica de inicio
+
     if (!payloadValidator()) {
         emitControlError(socket, action, roomId, 'invalid_param');
         return;
@@ -115,6 +117,7 @@ const handleControlCommand = async ({
                 socketId: socket.id,
                 error: err.message,
                 code: err.code,
+                latencyMs: Date.now() - startTime, // ✅ Métrica
             });
 
             // Mapeo de códigos de error → mensajes simples para el cliente
@@ -151,11 +154,25 @@ const handleControlCommand = async ({
 
     try {
         const result = await domainCall(effectiveUserId);
+
+        const totalLatencyMs = Date.now() - startTime; // ✅ Métrica total
+
         socket.emit('controlAck', {
             action,
             roomId,
             version: result?.version ?? null,
+            serverLatencyMs: totalLatencyMs, // ✅ Para debugging en cliente
         });
+
+        // Log solo si es lento
+        if (totalLatencyMs > 100) {
+            console.warn('[handleControlCommand] slow_operation', {
+                action,
+                roomId,
+                userId: effectiveUserId,
+                latencyMs: totalLatencyMs,
+            });
+        }
     } catch (error) {
         if (error instanceof RoomNotFoundError) {
             emitControlError(socket, action, roomId, 'room_not_found');
@@ -170,6 +187,7 @@ const handleControlCommand = async ({
             roomId,
             userId: effectiveUserId,
             error,
+            latencyMs: Date.now() - startTime, // ✅ Métrica
         });
         emitControlError(socket, action, roomId, 'internal_error');
     }
@@ -229,6 +247,63 @@ export async function handleDriftReport(socket, payload = {}) {
     }
 }
 
+/**
+ * ✅ OPTIMIZACIÓN: Detecta si es probable un cambio de track y envía prebuffer
+ */
+const checkAndPrebufferNextTrack = async (io, roomId, state) => {
+    // Solo si estamos cerca del final del track actual
+    if (!state || state.playbackState !== 'playing') {
+        return;
+    }
+
+    const currentPositionMs = RedisService.computeCurrentPosition(
+        state,
+        Date.now()
+    );
+
+    // Ejemplo: si no tenemos duración, no podemos predecir
+    // Esto requeriría integrar con queue-service para obtener duración
+    const estimatedDurationMs = state.durationMs || null;
+
+    if (!estimatedDurationMs) {
+        return;
+    }
+
+    const remainingMs = estimatedDurationMs - currentPositionMs;
+    const PREBUFFER_THRESHOLD_MS = 10000; // 10 segundos antes del final
+
+    if (remainingMs > 0 && remainingMs <= PREBUFFER_THRESHOLD_MS) {
+        // Obtener siguiente track de la cola
+        // Esto requiere integración con queue-service
+        try {
+            // Nota: Esta función necesitaría ser implementada
+            // const nextTrack = await getNextTrackFromQueue(roomId);
+
+            // Por ahora, comentado hasta que se implemente la integración
+            /*
+            if (nextTrack) {
+                io.to(roomChannel(roomId)).emit('prebuffer', {
+                    trackId: nextTrack.id,
+                    estimatedStartMs: 0,
+                    reason: 'queue_next',
+                });
+
+                console.log('[syncGateway] prebuffer enviado', {
+                    roomId,
+                    nextTrackId: nextTrack.id,
+                    remainingMs,
+                });
+            }
+            */
+        } catch (error) {
+            console.warn('[syncGateway] error en prebuffer predictivo', {
+                roomId,
+                error: error.message,
+            });
+        }
+    }
+};
+
 export function initSyncGateway(httpServer, { cors } = {}) {
     // ✅ CORS por defecto para Socket.IO
     const defaultCors = {
@@ -287,6 +362,21 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     continue;
                 }
 
+                // ✅ OPTIMIZACIÓN: Throttling basado en estado
+                // Solo enviar syncPacket si hay cambios relevantes o cada 5 segundos
+                const lastSync = state.lastSyncMs || 0;
+                const timeSinceLastSync = now - lastSync;
+                const SYNC_INTERVAL_MS = 5000;
+
+                const shouldSync =
+                    state.playbackState === 'playing' || // Siempre sync si está reproduciendo
+                    timeSinceLastSync >= SYNC_INTERVAL_MS || // O cada 5s si pausado
+                    state.version <= 3; // O en las primeras sincronizaciones
+
+                if (!shouldSync) {
+                    continue;
+                }
+
                 const positionMs = Math.floor(
                     RedisService.computeCurrentPosition(state, now),
                 );
@@ -300,12 +390,24 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     version: state.version ?? 0,
                 });
 
+                // Actualizar lastSyncMs en Redis
+                await RedisService.setRoomState(roomId, {
+                    ...state,
+                    lastSyncMs: now,
+                });
+
+                // ✅ Check para prebuffering
+                if (process.env.ENABLE_PREBUFFER === 'true') {
+                    await checkAndPrebufferNextTrack(io, roomId, state);
+                }
+
                 if (state.version % 30 === 0 || state.version < 3) {
                     console.log('[syncGateway] syncPacket', {
                         roomId,
                         users: localSize,
                         state: state.playbackState,
                         version: state.version,
+                        timeSinceLastSync,
                     });
                 }
             } catch (error) {
@@ -384,7 +486,7 @@ export function initSyncGateway(httpServer, { cors } = {}) {
 
         socket.on(
             'joinRoom',
-            withWsRequestId(({ roomId } = {}) => {
+            withWsRequestId(async ({ roomId, clientJoinTimestamp } = {}) => {
                 if (!isValidRoomId(roomId)) {
                     return;
                 }
@@ -397,14 +499,62 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                 Metrics.userJoin(roomId, socket.userId);
 
                 const roomSize = getLocalRoomSize(io, roomId);
+                const now = Date.now();
+
                 console.log('[syncGateway] user_joined_room', {
                     requestId: getRequestId(),
                     socketId: socket.id,
                     roomId,
                     userId: socket.userId,
                     roomSize,
+                    clientJoinTimestamp,
+                    serverJoinTimestamp: now,
                 });
 
+                // ✅ OPTIMIZACIÓN: Enviar initialSync inmediato
+                try {
+                    const state = await RedisService.getRoomState(roomId);
+
+                    if (state) {
+                        const positionMs = Math.floor(
+                            RedisService.computeCurrentPosition(state, now)
+                        );
+
+                        // Emitir solo a este socket específico
+                        socket.emit('initialSync', {
+                            roomId,
+                            serverTimeMs: now,
+                            playbackState: state.playbackState || 'paused',
+                            positionMs,
+                            trackId: state.trackId ?? null,
+                            version: state.version ?? 0,
+                            // Métricas para el cliente
+                            serverProcessingMs: clientJoinTimestamp
+                                ? now - clientJoinTimestamp
+                                : null,
+                        });
+
+                        console.log('[syncGateway] initialSync enviado', {
+                            requestId: getRequestId(),
+                            roomId,
+                            userId: socket.userId,
+                            trackId: state.trackId,
+                            positionMs,
+                            serverProcessingMs: clientJoinTimestamp
+                                ? now - clientJoinTimestamp
+                                : null,
+                        });
+                    }
+                } catch (error) {
+                    console.error('[syncGateway] error enviando initialSync', {
+                        requestId: getRequestId(),
+                        roomId,
+                        userId: socket.userId,
+                        error: error.message,
+                    });
+                }
+
+                // Notificar a otros usuarios después del initialSync
                 try {
                     io.to(channel).emit('roomUserJoin', {
                         roomId,
@@ -485,6 +635,30 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     roomId,
                     serverTimeMs: Date.now(),
                 });
+            }),
+        );
+
+        // ✅ OPTIMIZACIÓN: Handler de medición de latencia
+        socket.on(
+            'measureLatency',
+            withWsRequestId(({ clientTimestamp } = {}) => {
+                const serverTimestamp = Date.now();
+
+                socket.emit('latencyResponse', {
+                    clientTimestamp,
+                    serverTimestamp,
+                });
+
+                // Logging solo en debug mode
+                if (process.env.LOG_LEVEL === 'debug') {
+                    console.log('[syncGateway] latency_measurement', {
+                        requestId: getRequestId(),
+                        socketId: socket.id,
+                        userId: socket.userId,
+                        clientTimestamp,
+                        serverTimestamp,
+                    });
+                }
             }),
         );
 
