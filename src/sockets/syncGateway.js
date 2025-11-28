@@ -9,6 +9,7 @@ import {
 } from '../services/syncDomainService.js';
 import { decideCorrection } from '../utils/driftLogic.js';
 import { Metrics } from '../utils/metrics.js';
+import { resolveStreamUrl } from '../utils/streamUrlCache.js';
 import { pubClient, subClient } from '../config/redis.js';
 import { enforceRoomRateLimit } from '../utils/rateLimiter.js';
 import { withWsRequestId, getRequestId } from '../utils/requestLogger.js';
@@ -555,6 +556,57 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                             positionMs,
                             playbackState: state.playbackState,
                         });
+
+                        // ✅ OPTIMIZACIÓN ULTRA-RÁPIDA: Pre-resolver streamUrl y enviar fastSync
+                        // Esto se hace en paralelo, sin bloquear initialSync
+                        (async () => {
+                            try {
+                                const streamUrl = await resolveStreamUrl(state.trackId);
+
+                                if (streamUrl) {
+                                    // Recalcular posición actualizada
+                                    const updatedNow = Date.now();
+                                    const updatedPositionMs = Math.floor(
+                                        RedisService.computeCurrentPosition(state, updatedNow)
+                                    );
+
+                                    const fastSyncLatency = updatedNow - now;
+
+                                    // Enviar fastSync con streamUrl pre-resuelta
+                                    socket.emit('fastSync', {
+                                        trackId: state.trackId,
+                                        streamUrl, // ✅ URL ya resuelta por el servidor
+                                        positionMs: updatedPositionMs,
+                                        playbackState: state.playbackState || 'paused',
+                                        serverTimeMs: updatedNow,
+                                        networkLatency: joinLatency,
+                                        serverProcessingMs: fastSyncLatency,
+                                        version: state.version ?? 0,
+                                    });
+
+                                    if (process.env.LOG_LEVEL === 'debug') {
+                                        console.log('[syncGateway] fastSync enviado con streamUrl', {
+                                            requestId: getRequestId(),
+                                            roomId,
+                                            userId: socket.userId,
+                                            trackId: state.trackId,
+                                            totalLatencyMs: fastSyncLatency,
+                                        });
+                                    }
+                                } else {
+                                    console.warn('[syncGateway] No se pudo resolver streamUrl', {
+                                        roomId,
+                                        trackId: state.trackId,
+                                    });
+                                }
+                            } catch (error) {
+                                console.error('[syncGateway] Error resolviendo streamUrl', {
+                                    roomId,
+                                    trackId: state.trackId,
+                                    error: error.message,
+                                });
+                            }
+                        })();
                     }
                 } catch (error) {
                     console.error('[syncGateway] error enviando initialSync', {
@@ -674,6 +726,115 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                         serverTimestamp,
                         rttMs: rtt,
                         isHighLatency: rtt > 500,
+                    });
+                }
+            }),
+        );
+
+        // ✅ OPTIMIZACIÓN: Handler fastCommand para comandos ultra-rápidos
+        socket.on(
+            'fastCommand',
+            withWsRequestId(async ({
+                type,
+                roomId,
+                positionMs,
+                clientTimestamp,
+                trackId,
+                userId
+            } = {}) => {
+                const serverReceiveTime = Date.now();
+                const networkLatency = clientTimestamp ? serverReceiveTime - clientTimestamp : null;
+
+                // Validaciones básicas
+                if (!isValidRoomId(roomId) || !type) {
+                    return;
+                }
+
+                if (process.env.LOG_LEVEL === 'debug') {
+                    console.log('[syncGateway] ⚡ fastCommand recibido', {
+                        requestId: getRequestId(),
+                        type,
+                        roomId,
+                        userId: socket.userId,
+                        networkLatencyMs: networkLatency,
+                    });
+                }
+
+                try {
+                    // Ejecutar comando según el tipo
+                    let result;
+                    const effectiveUserId = socket.userId;
+
+                    if (type === 'play') {
+                        result = await SyncDomainService.play({
+                            roomId,
+                            userId: effectiveUserId,
+                            trackId: trackId || '',
+                            startPositionMs: positionMs || 0,
+                        });
+                    } else if (type === 'pause') {
+                        result = await SyncDomainService.pause({
+                            roomId,
+                            userId: effectiveUserId,
+                        });
+                    } else if (type === 'seek') {
+                        result = await SyncDomainService.seek({
+                            roomId,
+                            userId: effectiveUserId,
+                            positionMs: positionMs || 0,
+                        });
+                    } else {
+                        console.warn('[syncGateway] fastCommand tipo desconocido:', type);
+                        return;
+                    }
+
+                    const totalLatency = Date.now() - serverReceiveTime;
+
+                    // Emitir fastSync a todos los clientes en la sala
+                    io.to(roomChannel(roomId)).emit('fastSync', {
+                        type,
+                        positionMs: positionMs || 0,
+                        trackId: trackId || null,
+                        serverTimeMs: Date.now(),
+                        originalClientTimestamp: clientTimestamp,
+                        version: result?.version ?? null,
+                    });
+
+                    // Confirmar al cliente que envió el comando
+                    socket.emit('controlAck', {
+                        action: type,
+                        roomId,
+                        version: result?.version ?? null,
+                        serverLatencyMs: totalLatency,
+                    });
+
+                    if (process.env.LOG_LEVEL === 'debug' || totalLatency > 100) {
+                        const logLevel = totalLatency > 100 ? 'warn' : 'log';
+                        console[logLevel]('[syncGateway] ✓ fastCommand procesado', {
+                            requestId: getRequestId(),
+                            type,
+                            roomId,
+                            userId: socket.userId,
+                            totalLatencyMs: totalLatency,
+                            networkLatencyMs: networkLatency,
+                        });
+                    }
+                } catch (error) {
+                    const totalLatency = Date.now() - serverReceiveTime;
+
+                    console.error('[syncGateway] error en fastCommand', {
+                        requestId: getRequestId(),
+                        type,
+                        roomId,
+                        userId: socket.userId,
+                        error: error.message,
+                        latencyMs: totalLatency,
+                    });
+
+                    socket.emit('controlError', {
+                        action: type,
+                        roomId,
+                        error: 'internal_error',
                     });
                 }
             }),
