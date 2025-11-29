@@ -1,4 +1,3 @@
-
 import { Server as SocketIOServer } from 'socket.io';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { RedisService } from '../services/redisService.js';
@@ -783,6 +782,7 @@ export function initSyncGateway(httpServer, options) {
             }),
         );
 
+        // *********** fastCommand corregido: permisos + rate limit ***********
         socket.on(
             'fastCommand',
             withWsRequestId(
@@ -792,12 +792,12 @@ export function initSyncGateway(httpServer, options) {
                            positionMs,
                            clientTimestamp,
                            trackId,
-                           userId,
                        } = {}) => {
                     const serverReceiveTime = Date.now();
-                    const networkLatency = clientTimestamp
-                        ? serverReceiveTime - clientTimestamp
-                        : null;
+                    const networkLatency =
+                        typeof clientTimestamp === 'number'
+                            ? serverReceiveTime - clientTimestamp
+                            : null;
 
                     if (!isValidRoomId(roomId) || !type) {
                         return;
@@ -813,16 +813,46 @@ export function initSyncGateway(httpServer, options) {
                         });
                     }
 
-                    try {
-                        let result;
-                        const effectiveUserId = socket.userId;
+                    // Rate limit por acción (igual que handleControlCommand)
+                    const limits = CONTROL_LIMITS[type];
+                    if (limits) {
+                        const allowed = await enforceRoomRateLimit(
+                            roomId,
+                            type,
+                            limits.max,
+                            limits.windowMs,
+                        );
+                        if (!allowed) {
+                            emitControlError(socket, type, roomId, 'rate_limited');
+                            return;
+                        }
+                    }
 
+                    // Comprobación de permisos (ensureCanControlPlayback)
+                    const effectiveUserId = await getEffectiveUserIdForControl({
+                        socket,
+                        roomId,
+                        action: type,
+                        startTime: serverReceiveTime,
+                    });
+
+                    if (!effectiveUserId) {
+                        // Ya se notificó el error de auth al cliente
+                        return;
+                    }
+
+                    let result;
+
+                    try {
                         if (type === 'play') {
                             result = await SyncDomainService.play({
                                 roomId,
                                 userId: effectiveUserId,
                                 trackId: trackId || '',
-                                startPositionMs: positionMs || 0,
+                                startPositionMs:
+                                    typeof positionMs === 'number'
+                                        ? positionMs
+                                        : 0,
                             });
                         } else if (type === 'pause') {
                             result = await SyncDomainService.pause({
@@ -833,7 +863,10 @@ export function initSyncGateway(httpServer, options) {
                             result = await SyncDomainService.seek({
                                 roomId,
                                 userId: effectiveUserId,
-                                positionMs: positionMs || 0,
+                                positionMs:
+                                    typeof positionMs === 'number'
+                                        ? positionMs
+                                        : 0,
                             });
                         } else {
                             console.warn(
@@ -847,7 +880,7 @@ export function initSyncGateway(httpServer, options) {
 
                         io.to(roomChannel(roomId)).emit('fastSync', {
                             type,
-                            positionMs: positionMs || 0,
+                            positionMs: typeof positionMs === 'number' ? positionMs : 0,
                             trackId: trackId || null,
                             serverTimeMs: Date.now(),
                             originalClientTimestamp: clientTimestamp,
@@ -876,29 +909,19 @@ export function initSyncGateway(httpServer, options) {
                             );
                         }
                     } catch (error) {
-                        const totalLatency = Date.now() - serverReceiveTime;
-
-                        console.error(
-                            '[syncGateway] error en fastCommand',
-                            {
-                                requestId: getRequestId(),
-                                type,
-                                roomId,
-                                userId: socket.userId,
-                                error: error.message,
-                                latencyMs: totalLatency,
-                            },
-                        );
-
-                        socket.emit('controlError', {
+                        handleControlDomainError({
+                            socket,
                             action: type,
                             roomId,
-                            error: 'internal_error',
+                            error,
+                            effectiveUserId,
+                            startTime: serverReceiveTime,
                         });
                     }
                 },
             ),
         );
+        // *********** fin fastCommand corregido ***********
 
         socket.on(
             'driftReport',
