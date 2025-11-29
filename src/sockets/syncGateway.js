@@ -1,3 +1,4 @@
+
 import { Server as SocketIOServer } from 'socket.io';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { RedisService } from '../services/redisService.js';
@@ -21,6 +22,9 @@ const isValidRoomId = (roomId) =>
     typeof roomId === 'string' && roomId.trim().length > 0;
 
 const AUTH_BYPASS = process.env.AUTH_BYPASS === 'true';
+const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
+const ENABLE_PREBUFFER = process.env.ENABLE_PREBUFFER === 'true';
+const ALLOW_SINGLE_NODE = process.env.ALLOW_SINGLE_NODE === 'true';
 
 const CONTROL_LIMITS = {
     play: { max: 10, windowMs: 3000 },
@@ -28,6 +32,12 @@ const CONTROL_LIMITS = {
     seek: { max: 20, windowMs: 5000 },
     changeTrack: { max: 10, windowMs: 10000 },
 };
+
+// Intervalo base de sincronización (precalculado)
+const SYNC_INTERVAL_MS = Number.parseInt(
+    process.env.SYNC_INTERVAL_MS || '1000',
+    10,
+);
 
 const extractRoomIdFromChannel = (channel) => {
     if (!channel) {
@@ -183,7 +193,6 @@ const handleControlCommand = async ({
 
     try {
         const result = await domainCall(effectiveUserId);
-
         const totalLatencyMs = Date.now() - startTime;
 
         socket.emit('controlAck', {
@@ -322,7 +331,7 @@ const sendFastSyncWithStreamUrl = async ({
                 version: state.version ?? 0,
             });
 
-            if (process.env.LOG_LEVEL === 'debug') {
+            if (LOG_LEVEL === 'debug') {
                 console.log('[syncGateway] fastSync enviado con streamUrl', {
                     requestId: getRequestId(),
                     roomId,
@@ -358,7 +367,7 @@ const shouldSkipSyncForRoom = (roomId, now, recentSeeks) => {
         return false;
     }
 
-    if (process.env.LOG_LEVEL === 'debug') {
+    if (LOG_LEVEL === 'debug') {
         console.log('[syncGateway] syncPacket_skipped', {
             roomId,
             reason: 'recent_seek',
@@ -372,10 +381,6 @@ const shouldSkipSyncForRoom = (roomId, now, recentSeeks) => {
 const getSyncDecision = (state, now) => {
     const lastSync = state.lastSyncMs || 0;
     const timeSinceLastSync = now - lastSync;
-    const SYNC_INTERVAL_MS = Number.parseInt(
-        process.env.SYNC_INTERVAL_MS || '1000',
-        10,
-    );
 
     const shouldSync =
         state.playbackState === 'playing' ||
@@ -411,7 +416,7 @@ const emitRoomSyncPacket = async ({
         lastSyncMs: now,
     });
 
-    if (process.env.ENABLE_PREBUFFER === 'true') {
+    if (ENABLE_PREBUFFER) {
         await checkAndPrebufferNextTrack(io, roomId, state);
     }
 
@@ -443,12 +448,11 @@ export function initSyncGateway(httpServer, options) {
 
     const io = new SocketIOServer(httpServer, { cors: finalCors });
     const activeRooms = new Set();
-
     const recentSeeks = new Map();
 
     let controlUnsubscribe = null;
-    let syncInterval = null;
-    let handlersRegistered = false;
+    let syncLoopRunning = false;
+    let syncLoopStopped = false;
 
     const ensureRoomActive = (roomId) => {
         if (isValidRoomId(roomId)) {
@@ -473,23 +477,24 @@ export function initSyncGateway(httpServer, options) {
         }
 
         const now = Date.now();
+        const roomsSnapshot = Array.from(activeRooms);
 
-        for (const roomId of Array.from(activeRooms)) {
+        const tasks = roomsSnapshot.map(async (roomId) => {
             const localSize = getLocalRoomSize(io, roomId);
             if (!localSize) {
                 cleanupRoomIfEmpty(roomId);
-                continue;
+                return;
             }
 
             if (shouldSkipSyncForRoom(roomId, now, recentSeeks)) {
-                continue;
+                return;
             }
 
             try {
                 const state = await RedisService.getRoomState(roomId);
                 if (!state) {
                     activeRooms.delete(roomId);
-                    continue;
+                    return;
                 }
 
                 const { shouldSync, timeSinceLastSync } = getSyncDecision(
@@ -498,7 +503,7 @@ export function initSyncGateway(httpServer, options) {
                 );
 
                 if (!shouldSync) {
-                    continue;
+                    return;
                 }
 
                 await emitRoomSyncPacket({
@@ -515,25 +520,39 @@ export function initSyncGateway(httpServer, options) {
                     error,
                 );
             }
+        });
+
+        await Promise.all(tasks);
+    };
+
+    const scheduleNextSync = () => {
+        if (syncLoopStopped) {
+            syncLoopRunning = false;
+            return;
         }
+
+        setTimeout(async () => {
+            try {
+                await emitSyncPackets();
+            } catch (error) {
+                console.error('Error running sync loop', error);
+            } finally {
+                scheduleNextSync();
+            }
+        }, SYNC_INTERVAL_MS);
     };
 
     const startSyncLoop = () => {
-        if (syncInterval) {
-            clearInterval(syncInterval);
+        if (syncLoopRunning) {
+            return;
         }
-        syncInterval = setInterval(() => {
-            emitSyncPackets().catch((error) => {
-                console.error('Error running sync loop', error);
-            });
-        }, 1000);
+        syncLoopRunning = true;
+        syncLoopStopped = false;
+        scheduleNextSync();
     };
 
     const stopSyncLoop = () => {
-        if (syncInterval) {
-            clearInterval(syncInterval);
-            syncInterval = null;
-        }
+        syncLoopStopped = true;
     };
 
     const forwardControlMessage = async (message, channel) => {
@@ -593,7 +612,11 @@ export function initSyncGateway(httpServer, options) {
                 Metrics.userJoin(roomId, socket.userId);
 
                 const roomSize = getLocalRoomSize(io, roomId);
-                const now = Date.now();
+                const serverJoinTimestamp = Date.now();
+                const joinLatency =
+                    typeof clientJoinTimestamp === 'number'
+                        ? serverJoinTimestamp - clientJoinTimestamp
+                        : undefined;
 
                 console.log('[syncGateway] user_joined_room', {
                     requestId: getRequestId(),
@@ -602,7 +625,7 @@ export function initSyncGateway(httpServer, options) {
                     userId: socket.userId,
                     roomSize,
                     clientJoinTimestamp,
-                    serverJoinTimestamp: now,
+                    serverJoinTimestamp,
                 });
 
                 try {
@@ -610,12 +633,15 @@ export function initSyncGateway(httpServer, options) {
 
                     if (state?.trackId) {
                         const positionMs = Math.floor(
-                            RedisService.computeCurrentPosition(state, now),
+                            RedisService.computeCurrentPosition(
+                                state,
+                                serverJoinTimestamp,
+                            ),
                         );
 
                         socket.emit('initialSync', {
                             roomId,
-                            serverTimeMs: now,
+                            serverTimeMs: serverJoinTimestamp,
                             playbackState: state.playbackState || 'paused',
                             positionMs,
                             trackId: state.trackId,
@@ -635,8 +661,8 @@ export function initSyncGateway(httpServer, options) {
                             socket,
                             roomId,
                             state,
-                            initialServerTimeMs: now,
-                            joinLatency: undefined, // mismo comportamiento que antes: joinLatency no definido
+                            initialServerTimeMs: serverJoinTimestamp,
+                            joinLatency,
                         });
                     }
                 } catch (error) {
@@ -735,7 +761,6 @@ export function initSyncGateway(httpServer, options) {
             'measureLatency',
             withWsRequestId(({ clientTimestamp } = {}) => {
                 const serverTimestamp = Date.now();
-
                 const rtt = serverTimestamp - clientTimestamp;
 
                 socket.emit('latencyResponse', {
@@ -743,7 +768,7 @@ export function initSyncGateway(httpServer, options) {
                     serverTimestamp,
                 });
 
-                if (process.env.LOG_LEVEL === 'debug' || rtt > 500) {
+                if (LOG_LEVEL === 'debug' || rtt > 500) {
                     const logLevel = rtt > 500 ? 'warn' : 'log';
                     console[logLevel]('[syncGateway] latency_measurement', {
                         requestId: getRequestId(),
@@ -778,7 +803,7 @@ export function initSyncGateway(httpServer, options) {
                         return;
                     }
 
-                    if (process.env.LOG_LEVEL === 'debug') {
+                    if (LOG_LEVEL === 'debug') {
                         console.log('[syncGateway] fastCommand recibido', {
                             requestId: getRequestId(),
                             type,
@@ -836,10 +861,7 @@ export function initSyncGateway(httpServer, options) {
                             serverLatencyMs: totalLatency,
                         });
 
-                        if (
-                            process.env.LOG_LEVEL === 'debug' ||
-                            totalLatency > 100
-                        ) {
+                        if (LOG_LEVEL === 'debug' || totalLatency > 100) {
                             const logLevel = totalLatency > 100 ? 'warn' : 'log';
                             console[logLevel](
                                 '[syncGateway] fastCommand procesado',
@@ -949,11 +971,14 @@ export function initSyncGateway(httpServer, options) {
                         Number.isFinite(positionMs) &&
                         positionMs >= 0,
                     domainCall: async (userId) => {
-                        recentSeeks.set(roomId, Date.now());
+                        const now = Date.now();
+                        recentSeeks.set(roomId, now);
 
-                        setTimeout(() => recentSeeks.delete(roomId), 2000);
+                        setTimeout(() => {
+                            recentSeeks.delete(roomId);
+                        }, 2000);
 
-                        return await SyncDomainService.seek({
+                        return SyncDomainService.seek({
                             roomId,
                             userId,
                             positionMs,
@@ -1063,7 +1088,7 @@ export function initSyncGateway(httpServer, options) {
                 },
             );
 
-            if (process.env.ALLOW_SINGLE_NODE === 'true') {
+            if (ALLOW_SINGLE_NODE) {
                 console.warn(
                     '[syncGateway] Running in SINGLE-NODE mode (no Redis adapter)',
                 );
@@ -1075,10 +1100,7 @@ export function initSyncGateway(httpServer, options) {
             }
         }
 
-        if (!handlersRegistered) {
-            io.on('connection', registerSocketHandlers);
-            handlersRegistered = true;
-        }
+        io.on('connection', registerSocketHandlers);
 
         controlUnsubscribe = await RedisService.subscribe(
             CONTROL_CHANNEL_PATTERN,
