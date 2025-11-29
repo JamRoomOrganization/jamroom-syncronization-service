@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-
 /**
  * Script para configurar variables de entorno en Railway
  *
@@ -11,7 +10,6 @@
  *   - Autenticado con: railway login
  *   - Proyecto seleccionado con: railway link
  */
-
 import { execFileSync } from 'child_process';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -20,11 +18,22 @@ import { dirname, join } from 'path';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+const resolveRailwayCommand = () => {
+    const explicitPath = process.env.RAILWAY_CLI_PATH;
+    if (explicitPath && explicitPath.trim().length > 0) {
+        return explicitPath;
+    }
+    // Uso del PATH del sistema para un script de tooling local revisado manualmente
+    return 'railway'; // NOSONAR
+};
+
+const RAILWAY_CMD = resolveRailwayCommand();
+
 console.log('Railway Configuration Setup\n');
 
 // Verificar si Railway CLI está instalado
 try {
-    execFileSync('railway', ['--version'], { stdio: 'ignore' });
+    execFileSync(RAILWAY_CMD, ['--version'], { stdio: 'ignore' });
 } catch (error) {
     console.error('Railway CLI no está instalado.');
     console.error('   Instálalo con: npm i -g @railway/cli');
@@ -34,7 +43,7 @@ try {
 
 // Verificar si el proyecto está vinculado
 try {
-    execFileSync('railway', ['status'], { stdio: 'ignore' });
+    execFileSync(RAILWAY_CMD, ['status'], { stdio: 'ignore' });
 } catch (error) {
     console.error('El proyecto no está vinculado a Railway.');
     console.error('   Vincúlalo con: railway link');
@@ -46,7 +55,6 @@ console.log('Railway CLI instalado y proyecto vinculado\n');
 // Leer archivo .env
 const envPath = join(__dirname, '..', '.env');
 let envContent;
-
 try {
     envContent = readFileSync(envPath, 'utf-8');
 } catch (error) {
@@ -57,8 +65,8 @@ try {
 
 // Analizar variables de entorno
 const envVars = {};
-envContent.split('\n').forEach(line => {
-    line = line.trim();
+envContent.split('\n').forEach((lineRaw) => {
+    let line = lineRaw.trim();
     if (line && !line.startsWith('#') && line.includes('=')) {
         const [key, ...valueParts] = line.split('=');
         const value = valueParts.join('=');
@@ -67,11 +75,12 @@ envContent.split('\n').forEach(line => {
 });
 
 console.log('Variables encontradas en .env:\n');
-Object.keys(envVars).forEach(key => {
+Object.keys(envVars).forEach((key) => {
     const value = envVars[key];
-    const display = key.includes('PASSWORD') || key.includes('URL')
-        ? value.substring(0, 20) + '...'
-        : value;
+    const display =
+        key.includes('PASSWORD') || key.includes('URL')
+            ? value.substring(0, 20) + '...'
+            : value;
     console.log(`   ${key}=${display}`);
 });
 
@@ -91,9 +100,9 @@ Object.entries(envVars).forEach(([key, value]) => {
 
     try {
         console.log(`   Configurando ${key}...`);
-        execFileSync('railway', ['variables', 'set', `${key}=${value}`], {
+        execFileSync(RAILWAY_CMD, ['variables', 'set', `${key}=${value}`], {
             stdio: 'ignore',
-            encoding: 'utf-8'
+            encoding: 'utf-8',
         });
         successCount++;
         console.log(`   ${key} configurado`);
@@ -108,7 +117,6 @@ console.log(`   ${successCount} variables configuradas`);
 if (errorCount > 0) {
     console.log(`   ${errorCount} errores`);
 }
-
 console.log('\nConfiguración completada.');
 console.log('\nPróximos pasos:');
 console.log('   1. Verifica las variables: railway variables');

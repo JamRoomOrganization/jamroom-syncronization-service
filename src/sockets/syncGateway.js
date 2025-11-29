@@ -1,4 +1,3 @@
-
 import { Server as SocketIOServer } from 'socket.io';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { RedisService } from '../services/redisService.js';
@@ -266,7 +265,7 @@ export async function handleDriftReport(socket, payload = {}) {
             driftMs: decision.driftMs,
         });
     }
-};
+}
 
 const checkAndPrebufferNextTrack = async (io, roomId, state) => {
     if (!state || state.playbackState !== 'playing') {
@@ -287,15 +286,11 @@ const checkAndPrebufferNextTrack = async (io, roomId, state) => {
     const remainingMs = estimatedDurationMs - currentPositionMs;
     const PREBUFFER_THRESHOLD_MS = 10000;
 
-    if (remainingMs > 0 && remainingMs <= PREBUFFER_THRESHOLD_MS) {
-        try {
-        } catch (error) {
-            console.warn('[syncGateway] error en prebuffer predictivo', {
-                roomId,
-                error: error.message,
-            });
-        }
+    if (!(remainingMs > 0 && remainingMs <= PREBUFFER_THRESHOLD_MS)) {
+        return;
     }
+
+    // Lógica de prebuffer pendiente de implementar cuando se integre con queue-service.
 };
 
 const sendFastSyncWithStreamUrl = async ({
@@ -431,7 +426,9 @@ const emitRoomSyncPacket = async ({
     }
 };
 
-export function initSyncGateway(httpServer, { cors } = {}) {
+export function initSyncGateway(httpServer, options) {
+    const { cors = {} } = options || {};
+
     const defaultCors = {
         origin: toArray(process.env.CORS_ORIGIN) || '*',
         methods: ['GET', 'POST'],
@@ -440,7 +437,7 @@ export function initSyncGateway(httpServer, { cors } = {}) {
 
     const finalCors = {
         ...defaultCors,
-        ...(cors || {}),
+        ...cors,
         credentials: false,
     };
 
@@ -539,7 +536,7 @@ export function initSyncGateway(httpServer, { cors } = {}) {
         }
     };
 
-    const forwardControlMessage = async (message = {}, channel) => {
+    const forwardControlMessage = async (message, channel) => {
         const roomId = message?.roomId || extractRoomIdFromChannel(channel);
         if (!isValidRoomId(roomId)) {
             return;
@@ -557,7 +554,7 @@ export function initSyncGateway(httpServer, { cors } = {}) {
     };
 
     const registerSocketHandlers = (socket) => {
-        const rawAuth = socket.handshake.auth || {};
+        const rawAuth = socket.handshake?.auth ?? {};
         const accessToken =
             rawAuth.token || rawAuth.accessToken || null;
 
@@ -611,7 +608,7 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                 try {
                     const state = await RedisService.getRoomState(roomId);
 
-                    if (state && state.trackId) {
+                    if (state?.trackId) {
                         const positionMs = Math.floor(
                             RedisService.computeCurrentPosition(state, now),
                         );
@@ -639,7 +636,7 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                             roomId,
                             state,
                             initialServerTimeMs: now,
-                            joinLatency,
+                            joinLatency: undefined, // mismo comportamiento que antes: joinLatency no definido
                         });
                     }
                 } catch (error) {
