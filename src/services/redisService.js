@@ -1,5 +1,7 @@
-import { redisClient, pubClient, subClient, redlock, REDLOCK_CONFIG } from '../config/redis.js';
+import { randomBytes } from 'node:crypto';
+import { redisClient, pubClient, subClient, REDLOCK_CONFIG } from '../config/redis.js';
 import { getRequestId } from '../utils/requestLogger.js';
+
 
 const ROOM_PREFIX = 'room:';
 const ROOM_TTL_SECONDS = 60 * 30; // 30 min
@@ -50,11 +52,11 @@ export const RedisService = {
         const payload = {};
 
         for (const [field, value] of Object.entries(state)) {
-            if (value !== undefined && value !== null) {
-                // Convert numbers to strings to prevent precision issues
-                payload[field] = typeof value === 'number' ? String(value) : String(value);
+            if (value != null) {
+                payload[field] = String(value);
             }
         }
+
 
         // Always store roomId for consistency
         if (!payload.roomId) {
@@ -71,7 +73,8 @@ export const RedisService = {
 
     async getVersion(roomId) {
         const value = await redisClient.get(roomVersionKey(roomId));
-        return value ? Number(value) : 0;
+        // Uso del helper para evitar NaN ante valores corruptos
+        return toNumber(value, 0);
     },
 
     async nextVersion(roomId) {
@@ -104,16 +107,17 @@ export const RedisService = {
     },
 
     async lockRoom(roomId, ttlMs = REDLOCK_CONFIG.LOCK_TTL_MS) {
-
-
         const requestId = getRequestId();
         const key = lockKey(roomId);
-        const token = `${requestId}-${Date.now()}-${Math.random()
-            .toString(16)
-            .slice(2)}`;
-        const effectiveTtl = Number(ttlMs) > 0 ? Number(ttlMs) : 5000;
+
+        const numericTtl = Number(ttlMs);
+        const effectiveTtl =
+            Number.isFinite(numericTtl) && numericTtl > 0 ? numericTtl : 5000;
 
         try {
+            // Token robusto basado en crypto en lugar de Math.random
+            const token = `${requestId}-${Date.now()}-${randomBytes(16).toString('hex')}`;
+
             // node-redis v4: set(key, value, { PX, NX })
             const result = await redisClient.set(key, token, {
                 PX: effectiveTtl,
@@ -169,7 +173,10 @@ export const RedisService = {
                             requestId,
                             roomId,
                             key,
-                            error: err.message,
+                            error:
+                                (err && err.message) ?
+                                    err.message :
+                                    String(err),
                         });
                     }
                 },
@@ -181,7 +188,7 @@ export const RedisService = {
                 roomId,
                 key,
                 ttlMs: effectiveTtl,
-                error: err.message,
+                error: (err && err.message) ? err.message : String(err),
             });
 
             // Fallback no-op: NO lanzamos error, para que play/pause sigan funcionando
@@ -193,7 +200,6 @@ export const RedisService = {
         }
     },
 
-
     async publish(channel, message) {
         const messageWithMeta = {
             ...message,
@@ -202,22 +208,64 @@ export const RedisService = {
                 timestamp: Date.now(),
             },
         };
-        await pubClient.publish(channel, JSON.stringify(messageWithMeta));
+
+        try {
+            await pubClient.publish(channel, JSON.stringify(messageWithMeta));
+        } catch (error) {
+            console.error('[publish] Failed to publish message', {
+                requestId: messageWithMeta._meta.requestId,
+                channel,
+                error: (error && error.message) ? error.message : String(error),
+            });
+            // Re-lanzamos el error para no cambiar el flujo de control del caller
+            throw error;
+        }
     },
 
     async subscribe(pattern, handler) {
         // NOTE: Subscribe to Redis pub/sub with pattern matching
         // Returns unsubscribe function for clean shutdown
         await subClient.pSubscribe(pattern, (message, channel) => {
+            let parsed;
             try {
-                const parsed = JSON.parse(message);
-                handler(parsed, channel);
+                parsed = JSON.parse(message);
+
+                const result = handler(parsed, channel);
+                // Manejo defensivo para handlers async: evitar unhandled rejections
+                if (result && typeof result.then === 'function') {
+                    result.catch((error) => {
+                        const requestId =
+                            (parsed &&
+                                parsed._meta &&
+                                parsed._meta.requestId) ||
+                            getRequestId();
+
+                        console.error('[subscribe] Async handler error', {
+                            requestId,
+                            pattern,
+                            channel,
+                            error:
+                                (error && error.message) ?
+                                    error.message :
+                                    String(error),
+                        });
+                    });
+                }
             } catch (error) {
+                const requestId =
+                    (parsed &&
+                        parsed._meta &&
+                        parsed._meta.requestId) ||
+                    getRequestId();
+
                 console.error('[subscribe] Handler error', {
-                    requestId: parsed?._meta?.requestId || getRequestId(),
+                    requestId,
                     pattern,
                     channel,
-                    error: error.message,
+                    error:
+                        (error && error.message) ?
+                            error.message :
+                            String(error),
                 });
             }
         });
@@ -229,7 +277,7 @@ export const RedisService = {
             } catch (err) {
                 console.warn('[subscribe] Failed to pUnsubscribe', {
                     pattern,
-                    error: err.message,
+                    error: (err && err.message) ? err.message : String(err),
                 });
             }
         };

@@ -3,41 +3,72 @@ import { SyncDomainService } from '../services/syncDomainService.js';
 import { redisClient, pubClient, subClient } from '../config/redis.js';
 import { getRequestId } from '../utils/requestLogger.js';
 
-export function registerSyncRoutes(app) {
+// Helpers de validación reutilizables
+const isNonEmptyString = (value) =>
+    typeof value === 'string' && value.trim().length > 0;
 
+const isNonNegativeNumber = (value) =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0;
+
+const sendInvalidBody = (res, field) =>
+    res.status(400).json({ error: 'invalid_body', field });
+
+const validateUserId = (userId, res) => {
+    if (!isNonEmptyString(userId)) {
+        sendInvalidBody(res, 'userId');
+        return false;
+    }
+    return true;
+};
+
+const validateTrackId = (trackId, res) => {
+    if (!isNonEmptyString(trackId)) {
+        sendInvalidBody(res, 'trackId');
+        return false;
+    }
+    return true;
+};
+
+const validateStartPositionMs = (startPositionMs, res) => {
+    if (!isNonNegativeNumber(startPositionMs)) {
+        sendInvalidBody(res, 'startPositionMs');
+        return false;
+    }
+    return true;
+};
+
+const validatePositionMs = (positionMs, res) => {
+    if (!isNonNegativeNumber(positionMs)) {
+        sendInvalidBody(res, 'positionMs');
+        return false;
+    }
+    return true;
+};
+
+// Helper para el health check de Redis, evita duplicar try/catch
+const pingRedisClient = async (label, client) => {
+    try {
+        await client.ping();
+        return true;
+    } catch (err) {
+        console.error(
+            `[health] Redis ${label} client unhealthy`,
+            err && err.message ? err.message : err
+        );
+        return false;
+    }
+};
+
+export function registerSyncRoutes(app) {
     // NOTE: Health check endpoint for load balancers and monitoring
     // Returns 200 OK if all Redis clients are healthy
     // Returns 503 Service Unavailable if any Redis client is down
     app.get('/health', async (req, res) => {
         const checks = {
-            redis: false,
-            redisPub: false,
-            redisSub: false,
+            redis: await pingRedisClient('main', redisClient),
+            redisPub: await pingRedisClient('pub', pubClient),
+            redisSub: await pingRedisClient('sub', subClient),
         };
-
-        // Check main Redis client
-        try {
-            await redisClient.ping();
-            checks.redis = true;
-        } catch (err) {
-            console.error('[health] Redis main client unhealthy', err.message);
-        }
-
-        // Check pub client
-        try {
-            await pubClient.ping();
-            checks.redisPub = true;
-        } catch (err) {
-            console.error('[health] Redis pub client unhealthy', err.message);
-        }
-
-        // Check sub client
-        try {
-            await subClient.ping();
-            checks.redisSub = true;
-        } catch (err) {
-            console.error('[health] Redis sub client unhealthy', err.message);
-        }
 
         const healthy = checks.redis && checks.redisPub && checks.redisSub;
 
@@ -54,14 +85,12 @@ export function registerSyncRoutes(app) {
         if (!trackId) {
             return res.status(400).json({ error: 'invalid_trackId' });
         }
-
-        // TODO: mapear trackId l�gico -> URL Audius firmada
+        // TODO: mapear trackId lógico -> URL Audius firmada
         return res.json({
             trackId,
             streamUrl: trackId,
         });
     });
-
 
     app.get('/v1/rooms/:roomId/state', async (req, res) => {
         const requestId = getRequestId();
@@ -72,6 +101,7 @@ export function registerSyncRoutes(app) {
 
         try {
             const roomState = await RedisService.getRoomState(roomId);
+
             if (!roomState) {
                 console.warn(`[${requestId}] room ${roomId} not found`);
                 return res.status(404).json({ error: 'room_not_found' });
@@ -87,7 +117,7 @@ export function registerSyncRoutes(app) {
                 playbackState: roomState.playbackState,
                 effectivePositionMs,
                 serverTimeMs: nowServerMs,
-                version: roomState.version
+                version: roomState.version,
             });
         } catch (err) {
             console.error(
@@ -103,15 +133,15 @@ export function registerSyncRoutes(app) {
         const { roomId } = req.params;
         const { userId, trackId, startPositionMs = 0 } = req.body || {};
 
-        // NOTE: Validate required fields and types
-        if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
-            return res.status(400).json({ error: 'invalid_body', field: 'userId' });
+        // Validaciones equivalentes, ahora reutilizando helpers
+        if (!validateUserId(userId, res)) {
+            return;
         }
-        if (!trackId || typeof trackId !== 'string' || trackId.trim().length === 0) {
-            return res.status(400).json({ error: 'invalid_body', field: 'trackId' });
+        if (!validateTrackId(trackId, res)) {
+            return;
         }
-        if (typeof startPositionMs !== 'number' || !Number.isFinite(startPositionMs) || startPositionMs < 0) {
-            return res.status(400).json({ error: 'invalid_body', field: 'startPositionMs' });
+        if (!validateStartPositionMs(startPositionMs, res)) {
+            return;
         }
 
         try {
@@ -119,7 +149,7 @@ export function registerSyncRoutes(app) {
                 roomId,
                 userId,
                 trackId,
-                startPositionMs
+                startPositionMs,
             });
 
             console.log(
@@ -127,7 +157,7 @@ export function registerSyncRoutes(app) {
             );
             return res.json(result);
         } catch (err) {
-            if (err.message === 'room_not_found') {
+            if (err && err.message === 'room_not_found') {
                 console.warn(
                     `[${requestId}] room ${roomId} not found for play`
                 );
@@ -138,20 +168,19 @@ export function registerSyncRoutes(app) {
         }
     });
 
-
     app.post('/v1/rooms/:roomId/pause', async (req, res) => {
         const requestId = getRequestId();
         const { roomId } = req.params;
         const { userId } = req.body || {};
 
-        if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
-            return res.status(400).json({ error: 'invalid_body', field: 'userId' });
+        if (!validateUserId(userId, res)) {
+            return;
         }
 
         try {
             const result = await SyncDomainService.pause({
                 roomId,
-                userId
+                userId,
             });
 
             console.log(
@@ -159,7 +188,7 @@ export function registerSyncRoutes(app) {
             );
             return res.json(result);
         } catch (err) {
-            if (err.message === 'room_not_found') {
+            if (err && err.message === 'room_not_found') {
                 console.warn(
                     `[${requestId}] room ${roomId} not found for pause`
                 );
@@ -170,24 +199,23 @@ export function registerSyncRoutes(app) {
         }
     });
 
-
     app.post('/v1/rooms/:roomId/seek', async (req, res) => {
         const requestId = getRequestId();
         const { roomId } = req.params;
         const { userId, positionMs } = req.body || {};
 
-        if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
-            return res.status(400).json({ error: 'invalid_body', field: 'userId' });
+        if (!validateUserId(userId, res)) {
+            return;
         }
-        if (typeof positionMs !== 'number' || !Number.isFinite(positionMs) || positionMs < 0) {
-            return res.status(400).json({ error: 'invalid_body', field: 'positionMs' });
+        if (!validatePositionMs(positionMs, res)) {
+            return;
         }
 
         try {
             const result = await SyncDomainService.seek({
                 roomId,
                 userId,
-                positionMs
+                positionMs,
             });
 
             console.log(
@@ -195,7 +223,7 @@ export function registerSyncRoutes(app) {
             );
             return res.json(result);
         } catch (err) {
-            if (err.message === 'room_not_found') {
+            if (err && err.message === 'room_not_found') {
                 console.warn(
                     `[${requestId}] room ${roomId} not found for seek`
                 );
@@ -206,20 +234,19 @@ export function registerSyncRoutes(app) {
         }
     });
 
-
     app.post('/v1/rooms/:roomId/track', async (req, res) => {
         const requestId = getRequestId();
         const { roomId } = req.params;
         const { userId, trackId, startPositionMs = 0 } = req.body || {};
 
-        if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
-            return res.status(400).json({ error: 'invalid_body', field: 'userId' });
+        if (!validateUserId(userId, res)) {
+            return;
         }
-        if (!trackId || typeof trackId !== 'string' || trackId.trim().length === 0) {
-            return res.status(400).json({ error: 'invalid_body', field: 'trackId' });
+        if (!validateTrackId(trackId, res)) {
+            return;
         }
-        if (typeof startPositionMs !== 'number' || !Number.isFinite(startPositionMs) || startPositionMs < 0) {
-            return res.status(400).json({ error: 'invalid_body', field: 'startPositionMs' });
+        if (!validateStartPositionMs(startPositionMs, res)) {
+            return;
         }
 
         try {
@@ -227,7 +254,7 @@ export function registerSyncRoutes(app) {
                 roomId,
                 userId,
                 trackId,
-                startPositionMs
+                startPositionMs,
             });
 
             console.log(
@@ -235,18 +262,19 @@ export function registerSyncRoutes(app) {
             );
             return res.json(result);
         } catch (err) {
-            console.error(`[${requestId}] TRACK CHANGE error`, err);
+            console.error(
+                `[${requestId}] TRACK CHANGE error`,
+                err
+            );
             return res.status(500).json({ error: 'internal_error' });
         }
     });
-
 
     app.get('/debug/state/:roomId', async (req, res) => {
         const { roomId } = req.params;
         try {
             const roomState = await RedisService.getRoomState(roomId);
             const version = await RedisService.getVersion?.(roomId);
-
             return res.json({
                 exists: !!(roomState && Object.keys(roomState).length),
                 roomState,

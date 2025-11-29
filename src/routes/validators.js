@@ -14,9 +14,25 @@ const normalizePlaybackRate = (value) => {
     return { ok: true, value };
 };
 
-export function validatePlayBody(body = {}) {
+/**
+ * Valida que exista un userId no vacío en el body.
+ * Devuelve exactamente el mismo formato de error que las funciones públicas.
+ */
+const validateUserIdField = (body) => {
     if (!isNonEmptyString(body.userId)) {
         return { ok: false, error: { field: 'userId', reason: 'required' } };
+    }
+    return { ok: true };
+};
+
+/**
+ * Lógica común a validatePlayBody y validateTrackBody.
+ * Mantiene exactamente la misma estructura de retorno que antes.
+ */
+const validatePlayOrTrackBody = (body = {}) => {
+    const userIdValidation = validateUserIdField(body);
+    if (!userIdValidation.ok) {
+        return userIdValidation;
     }
 
     if (!isNonEmptyString(body.trackId)) {
@@ -44,11 +60,16 @@ export function validatePlayBody(body = {}) {
             playbackRate: playbackRateResult.value,
         },
     };
+};
+
+export function validatePlayBody(body = {}) {
+    return validatePlayOrTrackBody(body);
 }
 
 export function validatePauseBody(body = {}) {
-    if (!isNonEmptyString(body.userId)) {
-        return { ok: false, error: { field: 'userId', reason: 'required' } };
+    const userIdValidation = validateUserIdField(body);
+    if (!userIdValidation.ok) {
+        return userIdValidation;
     }
 
     return {
@@ -60,8 +81,9 @@ export function validatePauseBody(body = {}) {
 }
 
 export function validateSeekBody(body = {}) {
-    if (!isNonEmptyString(body.userId)) {
-        return { ok: false, error: { field: 'userId', reason: 'required' } };
+    const userIdValidation = validateUserIdField(body);
+    if (!userIdValidation.ok) {
+        return userIdValidation;
     }
 
     if (!isNonNegativeNumber(body.positionMs)) {
@@ -78,33 +100,5 @@ export function validateSeekBody(body = {}) {
 }
 
 export function validateTrackBody(body = {}) {
-    if (!isNonEmptyString(body.userId)) {
-        return { ok: false, error: { field: 'userId', reason: 'required' } };
-    }
-
-    if (!isNonEmptyString(body.trackId)) {
-        return { ok: false, error: { field: 'trackId', reason: 'required' } };
-    }
-
-    const startPosition =
-        body.startPositionMs === undefined ? 0 : body.startPositionMs;
-
-    if (!isNonNegativeNumber(startPosition)) {
-        return { ok: false, error: { field: 'startPositionMs', reason: 'invalid' } };
-    }
-
-    const playbackRateResult = normalizePlaybackRate(body.playbackRate);
-    if (!playbackRateResult.ok) {
-        return playbackRateResult;
-    }
-
-    return {
-        ok: true,
-        data: {
-            userId: body.userId.trim(),
-            trackId: body.trackId.trim(),
-            startPositionMs: startPosition,
-            playbackRate: playbackRateResult.value,
-        },
-    };
+    return validatePlayOrTrackBody(body);
 }

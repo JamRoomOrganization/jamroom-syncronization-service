@@ -15,7 +15,6 @@ class AuthError extends Error {
     }
 }
 
-// ---- utilidades de cache de host (modo actual Redis legacy) ----
 
 const cacheGet = (roomId) => {
     const entry = hostCache.get(roomId);
@@ -46,7 +45,59 @@ const fetchHostUserId = async (roomId) => {
     return hostUserId || null;
 };
 
-// ---- API pública ----
+
+function validatePlaybackControlParams(roomId, accessToken) {
+    if (!isSafeId(roomId)) {
+        throw new AuthError('Invalid roomId', 'INVALID_ROOM_ID', 400);
+    }
+
+    if (!accessToken) {
+        throw new AuthError('Missing access token', 'UNAUTHORIZED', 401);
+    }
+}
+
+function mapQueueMembershipClientError(err) {
+    if (err && err.response) {
+        const { status, data } = err.response;
+
+        if (status === 404) {
+            throw new AuthError(
+                'Membership not found',
+                'MEMBERSHIP_NOT_FOUND',
+                404,
+            );
+        }
+
+        if (status === 401) {
+            throw new AuthError('Unauthorized', 'UNAUTHORIZED', 401);
+        }
+
+        if (status === 403) {
+            throw new AuthError('Forbidden', 'FORBIDDEN', 403);
+        }
+
+        throw new AuthError(
+            (data && data.message) || 'Queue service error',
+            'QUEUE_SERVICE_ERROR',
+            status,
+        );
+    }
+
+    if (err && (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT')) {
+        throw new AuthError(
+            'Queue service unavailable',
+            'QUEUE_SERVICE_UNAVAILABLE',
+            503,
+        );
+    }
+
+    throw new AuthError(
+        (err && err.message) || 'Unknown auth error',
+        'AUTH_UNKNOWN_ERROR',
+        500,
+    );
+}
+
 
 export const AuthService = {
     /**
@@ -124,13 +175,8 @@ export const AuthService = {
      * Lanza AuthError con .code y .status para que el caller lo mapee.
      */
     async ensureCanControlPlayback({ accessToken, roomId }) {
-        if (!isSafeId(roomId)) {
-            throw new AuthError('Invalid roomId', 'INVALID_ROOM_ID', 400);
-        }
-
-        if (!accessToken) {
-            throw new AuthError('Missing access token', 'UNAUTHORIZED', 401);
-        }
+        // Validación de parámetros extraída a helper
+        validatePlaybackControlParams(roomId, accessToken);
 
         let membership;
         try {
@@ -139,46 +185,8 @@ export const AuthService = {
                 accessToken,
             });
         } catch (err) {
-            // Mapeamos errores HTTP del queue-service (axios-style)
-            if (err.response) {
-                const { status, data } = err.response;
-
-                if (status === 404) {
-                    throw new AuthError(
-                        'Membership not found',
-                        'MEMBERSHIP_NOT_FOUND',
-                        404,
-                    );
-                }
-
-                if (status === 401) {
-                    throw new AuthError('Unauthorized', 'UNAUTHORIZED', 401);
-                }
-
-                if (status === 403) {
-                    throw new AuthError('Forbidden', 'FORBIDDEN', 403);
-                }
-
-                throw new AuthError(
-                    data?.message || 'Queue service error',
-                    'QUEUE_SERVICE_ERROR',
-                    status,
-                );
-            }
-
-            if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT') {
-                throw new AuthError(
-                    'Queue service unavailable',
-                    'QUEUE_SERVICE_UNAVAILABLE',
-                    503,
-                );
-            }
-
-            throw new AuthError(
-                err.message || 'Unknown auth error',
-                'AUTH_UNKNOWN_ERROR',
-                500,
-            );
+            // Lógica de mapeo de errores extraída a helper
+            mapQueueMembershipClientError(err);
         }
 
         const roles = membership.roles || [];

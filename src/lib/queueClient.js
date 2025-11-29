@@ -1,32 +1,27 @@
 /**
- * Cliente HTTP centralizado para comunicarse con el queue-service
- *
- * Utiliza la variable de entorno QUEUE_SERVICE_URL para determinar la base URL.
- * Si no está definida, usa http://localhost:3000 por defecto.
- *
- * Todas las peticiones incluyen timeout y headers consistentes.
- */
-
-/**
  * Normaliza la URL base eliminando slashes finales y validando el protocolo
  * @param {string} url - URL a normalizar
  * @returns {string} URL normalizada
  */
 const normalizeBaseUrl = (url) => {
-  if (!url || typeof url !== 'string') {
-    return 'http://localhost:3000';
-  }
+    if (!url || typeof url !== 'string') {
+        return 'http://localhost:3000';
+    }
 
-  // Remover slashes finales
-  let normalized = url.replace(/\/+$/, '');
+    // Remover slashes finales sin usar regex
+    let normalized = url;
+    while (normalized.endsWith('/')) {
+        normalized = normalized.slice(0, -1);
+    }
 
-  // Asegurar protocolo
-  if (!normalized.startsWith('http://') && !normalized.startsWith('https://')) {
-    normalized = `http://${normalized}`;
-  }
+    // Asegurar protocolo
+    if (!normalized.startsWith('http://') && !normalized.startsWith('https://')) {
+        normalized = `http://${normalized}`;
+    }
 
-  return normalized;
+    return normalized;
 };
+
 
 /**
  * Normaliza un path eliminando slashes duplicados y asegurando que empiece con /
@@ -44,7 +39,7 @@ const normalizePath = (path) => {
   }
 
   // Eliminar slashes duplicados
-  path = path.replace(/\/+/g, '/');
+  path = path.replaceAll(/\/+/g, '/');
 
   return path;
 };

@@ -12,7 +12,7 @@
  *   - Proyecto seleccionado con: railway link
  */
 
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -20,41 +20,42 @@ import { dirname, join } from 'path';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-console.log('🚂 Railway Configuration Setup\n');
+console.log('Railway Configuration Setup\n');
 
-// Check if Railway CLI is installed
+// Verificar si Railway CLI está instalado
 try {
-    execSync('railway --version', { stdio: 'ignore' });
+    execFileSync('railway', ['--version'], { stdio: 'ignore' });
 } catch (error) {
-    console.error('❌ Railway CLI no está instalado.');
+    console.error('Railway CLI no está instalado.');
     console.error('   Instálalo con: npm i -g @railway/cli');
     console.error('   Más info: https://docs.railway.app/develop/cli');
     process.exit(1);
 }
 
-// Check if project is linked
+// Verificar si el proyecto está vinculado
 try {
-    execSync('railway status', { stdio: 'ignore' });
+    execFileSync('railway', ['status'], { stdio: 'ignore' });
 } catch (error) {
-    console.error('❌ Proyecto no está vinculado a Railway.');
-    console.error('   Vincula con: railway link');
+    console.error('El proyecto no está vinculado a Railway.');
+    console.error('   Vincúlalo con: railway link');
     process.exit(1);
 }
 
-console.log('✅ Railway CLI instalado y proyecto vinculado\n');
+console.log('Railway CLI instalado y proyecto vinculado\n');
 
-// Read .env file
+// Leer archivo .env
 const envPath = join(__dirname, '..', '.env');
 let envContent;
+
 try {
     envContent = readFileSync(envPath, 'utf-8');
 } catch (error) {
-    console.error('❌ No se pudo leer el archivo .env');
+    console.error('No se pudo leer el archivo .env');
     console.error('   Asegúrate de que existe en:', envPath);
     process.exit(1);
 }
 
-// Parse environment variables
+// Analizar variables de entorno
 const envVars = {};
 envContent.split('\n').forEach(line => {
     line = line.trim();
@@ -65,7 +66,7 @@ envContent.split('\n').forEach(line => {
     }
 });
 
-console.log('📋 Variables encontradas en .env:\n');
+console.log('Variables encontradas en .env:\n');
 Object.keys(envVars).forEach(key => {
     const value = envVars[key];
     const display = key.includes('PASSWORD') || key.includes('URL')
@@ -74,36 +75,42 @@ Object.keys(envVars).forEach(key => {
     console.log(`   ${key}=${display}`);
 });
 
-console.log('\n🔄 Configurando variables en Railway...\n');
+console.log('\nConfigurando variables en Railway...\n');
 
-// Set variables in Railway
+// Configurar variables en Railway
 let successCount = 0;
 let errorCount = 0;
 
 Object.entries(envVars).forEach(([key, value]) => {
+    // Validación básica del nombre de la variable
+    if (!/^[A-Z0-9_]+$/i.test(key)) {
+        console.error(`Nombre de variable inválido: ${key}`);
+        errorCount++;
+        return;
+    }
+
     try {
         console.log(`   Configurando ${key}...`);
-        execSync(`railway variables set ${key}="${value}"`, {
+        execFileSync('railway', ['variables', 'set', `${key}=${value}`], {
             stdio: 'ignore',
             encoding: 'utf-8'
         });
         successCount++;
-        console.log(`   ✅ ${key} configurado`);
+        console.log(`   ${key} configurado`);
     } catch (error) {
         errorCount++;
-        console.error(`   ❌ Error configurando ${key}`);
+        console.error(`   Error configurando ${key}`);
     }
 });
 
-console.log('\n📊 Resumen:');
-console.log(`   ✅ ${successCount} variables configuradas`);
+console.log('\nResumen:');
+console.log(`   ${successCount} variables configuradas`);
 if (errorCount > 0) {
-    console.log(`   ❌ ${errorCount} errores`);
+    console.log(`   ${errorCount} errores`);
 }
 
-console.log('\n🎉 ¡Configuración completada!');
+console.log('\nConfiguración completada.');
 console.log('\nPróximos pasos:');
 console.log('   1. Verifica las variables: railway variables');
 console.log('   2. Despliega: git push origin main');
 console.log('   3. Revisa los logs: railway logs');
-

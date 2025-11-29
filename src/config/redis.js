@@ -13,7 +13,7 @@ const RAILWAY_REDIS_PASSWORD = process.env.RAILWAY_REDIS_PASSWORD;
 
 const REDIS_URL = RAILWAY_REDIS_URL || process.env.REDIS_URL; // Prefer public Railway URL when present
 const REDIS_HOST = RAILWAY_REDIS_HOST || process.env.REDIS_HOST || '127.0.0.1';
-const REDIS_PORT = parseInt(RAILWAY_REDIS_PORT || process.env.REDIS_PORT || '6379', 10);
+const REDIS_PORT = Number.parseInt(RAILWAY_REDIS_PORT || process.env.REDIS_PORT || '6379', 10);
 const REDIS_TLS = process.env.REDIS_TLS === 'true';
 const REDIS_PASSWORD = RAILWAY_REDIS_PASSWORD || process.env.REDIS_PASSWORD || undefined;
 
@@ -25,10 +25,10 @@ const REDIS_CLUSTER_MODE = process.env.REDIS_CLUSTER_MODE === 'true';
 
 // Redlock configuration
 const REDLOCK_ENABLED = process.env.REDLOCK_ENABLED !== 'false'; // Default: enabled
-const LOCK_TTL_MS = parseInt(process.env.LOCK_TTL_MS || '5000', 10); // Default: 5000ms
-const REDLOCK_RETRY_COUNT = parseInt(process.env.REDLOCK_RETRY_COUNT || '10', 10);
-const REDLOCK_RETRY_DELAY = parseInt(process.env.REDLOCK_RETRY_DELAY || '200', 10);
-const REDLOCK_RETRY_JITTER = parseInt(process.env.REDLOCK_RETRY_JITTER || '200', 10);
+const LOCK_TTL_MS = Number.parseInt(process.env.LOCK_TTL_MS || '5000', 10); // Default: 5000ms
+const REDLOCK_RETRY_COUNT = Number.parseInt(process.env.REDLOCK_RETRY_COUNT || '10', 10);
+const REDLOCK_RETRY_DELAY = Number.parseInt(process.env.REDLOCK_RETRY_DELAY || '200', 10);
+const REDLOCK_RETRY_JITTER = Number.parseInt(process.env.REDLOCK_RETRY_JITTER || '200', 10);
 
 // Sentinel configuration
 const REDIS_SENTINELS = process.env.REDIS_SENTINELS; // JSON array: [{"host":"h1","port":26379}]
@@ -190,7 +190,7 @@ redisClient.on('ready', () => {
 export const pubClient = createRedisClientForMode();
 pubClient.on('error', (err) => {
   console.error('[redis] pub client error', err.message);
-  // ⚠️ NO cerrar el cliente aquí, dejarlo reconectar solo
+
 });
 pubClient.on('reconnecting', () => {
   console.warn('[redis] pub client reconnecting...');

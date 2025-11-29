@@ -1,4 +1,4 @@
-// src/sockets/syncGateway.js
+
 import { Server as SocketIOServer } from 'socket.io';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { RedisService } from '../services/redisService.js';
@@ -24,9 +24,9 @@ const isValidRoomId = (roomId) =>
 const AUTH_BYPASS = process.env.AUTH_BYPASS === 'true';
 
 const CONTROL_LIMITS = {
-    play: { max: 10, windowMs: 3000 },    // ✅ Reducido throttling para mejor UX
-    pause: { max: 10, windowMs: 3000 },   // ✅ Reducido throttling para mejor UX
-    seek: { max: 20, windowMs: 5000 },    // ✅ Mantener flexible
+    play: { max: 10, windowMs: 3000 },
+    pause: { max: 10, windowMs: 3000 },
+    seek: { max: 20, windowMs: 5000 },
     changeTrack: { max: 10, windowMs: 10000 },
 };
 
@@ -52,13 +52,97 @@ const emitControlError = (socket, action, roomId, error) => {
     });
 };
 
-/**
- * Maneja un comando de control (play, pause, seek, changeTrack)
- * - Valida payload
- * - Aplica rate limit por sala
- * - Verifica permisos contra queue-service (AuthService.ensureCanControlPlayback)
- * - Ejecuta la operación de dominio
- */
+const mapAuthErrorCodeToClientError = (code) => {
+    switch (code) {
+        case 'MEMBERSHIP_NOT_FOUND':
+            return 'membership_not_found';
+        case 'ROOM_CONTROL_FORBIDDEN':
+        case 'FORBIDDEN':
+            return 'forbidden';
+        case 'UNAUTHORIZED':
+            return 'unauthorized';
+        case 'QUEUE_SERVICE_UNAVAILABLE':
+            return 'upstream_unavailable';
+        default:
+            return 'internal_error';
+    }
+};
+
+const handleControlAuthError = ({ socket, action, roomId, err, startTime }) => {
+    console.warn('[handleControlCommand] permission denied/error', {
+        action,
+        roomId,
+        socketId: socket.id,
+        error: err.message,
+        code: err.code,
+        latencyMs: Date.now() - startTime,
+    });
+
+    const clientError = mapAuthErrorCodeToClientError(err.code);
+    emitControlError(socket, action, roomId, clientError);
+};
+
+const getEffectiveUserIdForControl = async ({
+                                                socket,
+                                                roomId,
+                                                action,
+                                                startTime,
+                                            }) => {
+    let effectiveUserId = socket.userId;
+
+    if (!socket.data?.accessToken && AUTH_BYPASS) {
+        console.warn(
+            '[handleControlCommand] AUTH_BYPASS enabled, skipping permission check',
+            {
+                action,
+                roomId,
+                socketId: socket.id,
+                userId: socket.userId,
+            },
+        );
+        return effectiveUserId;
+    }
+
+    try {
+        const membership = await AuthService.ensureCanControlPlayback({
+            accessToken: socket.data?.accessToken,
+            roomId,
+        });
+
+        return membership.user_id || membership.userId || socket.userId;
+    } catch (err) {
+        handleControlAuthError({ socket, action, roomId, err, startTime });
+        return null;
+    }
+};
+
+const handleControlDomainError = ({
+                                      socket,
+                                      action,
+                                      roomId,
+                                      error,
+                                      effectiveUserId,
+                                      startTime,
+                                  }) => {
+    if (error instanceof RoomNotFoundError) {
+        emitControlError(socket, action, roomId, 'room_not_found');
+        return;
+    }
+
+    if (error?.message === 'invalid_track') {
+        emitControlError(socket, action, roomId, 'invalid_track');
+        return;
+    }
+
+    console.error(`Failed to process control action ${action}`, {
+        roomId,
+        userId: effectiveUserId,
+        error,
+        latencyMs: Date.now() - startTime,
+    });
+    emitControlError(socket, action, roomId, 'internal_error');
+};
+
 const handleControlCommand = async ({
                                         action,
                                         socket,
@@ -66,7 +150,7 @@ const handleControlCommand = async ({
                                         payloadValidator,
                                         domainCall,
                                     }) => {
-    const startTime = Date.now(); // ✅ Métrica de inicio
+    const startTime = Date.now();
 
     if (!payloadValidator()) {
         emitControlError(socket, action, roomId, 'invalid_param');
@@ -87,85 +171,29 @@ const handleControlCommand = async ({
         }
     }
 
-    // 🔐 Resolución de permisos: queue-service vía AuthService
-    let effectiveUserId = socket.userId;
+    const effectiveUserId = await getEffectiveUserIdForControl({
+        socket,
+        roomId,
+        action,
+        startTime,
+    });
 
-    if (!socket.data?.accessToken && AUTH_BYPASS) {
-        // Modo DEV: dejamos pasar, pero avisamos en logs
-        console.warn(
-            '[handleControlCommand] AUTH_BYPASS enabled, skipping permission check',
-            {
-                action,
-                roomId,
-                socketId: socket.id,
-                userId: socket.userId,
-            },
-        );
-    } else {
-        try {
-            const membership = await AuthService.ensureCanControlPlayback({
-                accessToken: socket.data?.accessToken,
-                roomId,
-            });
-
-            // Tomamos el user_id real de room_members como userId efectivo
-            effectiveUserId =
-                membership.user_id || membership.userId || socket.userId;
-        } catch (err) {
-            console.warn('[handleControlCommand] permission denied/error', {
-                action,
-                roomId,
-                socketId: socket.id,
-                error: err.message,
-                code: err.code,
-                latencyMs: Date.now() - startTime, // ✅ Métrica
-            });
-
-            // Mapeo de códigos de error → mensajes simples para el cliente
-            switch (err.code) {
-                case 'MEMBERSHIP_NOT_FOUND':
-                    emitControlError(
-                        socket,
-                        action,
-                        roomId,
-                        'membership_not_found',
-                    );
-                    return;
-                case 'ROOM_CONTROL_FORBIDDEN':
-                case 'FORBIDDEN':
-                    emitControlError(socket, action, roomId, 'forbidden');
-                    return;
-                case 'UNAUTHORIZED':
-                    emitControlError(socket, action, roomId, 'unauthorized');
-                    return;
-                case 'QUEUE_SERVICE_UNAVAILABLE':
-                    emitControlError(
-                        socket,
-                        action,
-                        roomId,
-                        'upstream_unavailable',
-                    );
-                    return;
-                default:
-                    emitControlError(socket, action, roomId, 'internal_error');
-                    return;
-            }
-        }
+    if (!effectiveUserId) {
+        return;
     }
 
     try {
         const result = await domainCall(effectiveUserId);
 
-        const totalLatencyMs = Date.now() - startTime; // ✅ Métrica total
+        const totalLatencyMs = Date.now() - startTime;
 
         socket.emit('controlAck', {
             action,
             roomId,
             version: result?.version ?? null,
-            serverLatencyMs: totalLatencyMs, // ✅ Para debugging en cliente
+            serverLatencyMs: totalLatencyMs,
         });
 
-        // Log solo si es lento
         if (totalLatencyMs > 100) {
             console.warn('[handleControlCommand] slow_operation', {
                 action,
@@ -175,22 +203,14 @@ const handleControlCommand = async ({
             });
         }
     } catch (error) {
-        if (error instanceof RoomNotFoundError) {
-            emitControlError(socket, action, roomId, 'room_not_found');
-            return;
-        }
-        if (error?.message === 'invalid_track') {
-            emitControlError(socket, action, roomId, 'invalid_track');
-            return;
-        }
-
-        console.error(`Failed to process control action ${action}`, {
+        handleControlDomainError({
+            socket,
+            action,
             roomId,
-            userId: effectiveUserId,
             error,
-            latencyMs: Date.now() - startTime, // ✅ Métrica
+            effectiveUserId,
+            startTime,
         });
-        emitControlError(socket, action, roomId, 'internal_error');
     }
 };
 
@@ -246,24 +266,18 @@ export async function handleDriftReport(socket, payload = {}) {
             driftMs: decision.driftMs,
         });
     }
-}
+};
 
-/**
- * ✅ OPTIMIZACIÓN: Detecta si es probable un cambio de track y envía prebuffer
- */
 const checkAndPrebufferNextTrack = async (io, roomId, state) => {
-    // Solo si estamos cerca del final del track actual
     if (!state || state.playbackState !== 'playing') {
         return;
     }
 
     const currentPositionMs = RedisService.computeCurrentPosition(
         state,
-        Date.now()
+        Date.now(),
     );
 
-    // Ejemplo: si no tenemos duración, no podemos predecir
-    // Esto requeriría integrar con queue-service para obtener duración
     const estimatedDurationMs = state.durationMs || null;
 
     if (!estimatedDurationMs) {
@@ -271,31 +285,10 @@ const checkAndPrebufferNextTrack = async (io, roomId, state) => {
     }
 
     const remainingMs = estimatedDurationMs - currentPositionMs;
-    const PREBUFFER_THRESHOLD_MS = 10000; // 10 segundos antes del final
+    const PREBUFFER_THRESHOLD_MS = 10000;
 
     if (remainingMs > 0 && remainingMs <= PREBUFFER_THRESHOLD_MS) {
-        // Obtener siguiente track de la cola
-        // Esto requiere integración con queue-service
         try {
-            // Nota: Esta función necesitaría ser implementada
-            // const nextTrack = await getNextTrackFromQueue(roomId);
-
-            // Por ahora, comentado hasta que se implemente la integración
-            /*
-            if (nextTrack) {
-                io.to(roomChannel(roomId)).emit('prebuffer', {
-                    trackId: nextTrack.id,
-                    estimatedStartMs: 0,
-                    reason: 'queue_next',
-                });
-
-                console.log('[syncGateway] prebuffer enviado', {
-                    roomId,
-                    nextTrackId: nextTrack.id,
-                    remainingMs,
-                });
-            }
-            */
         } catch (error) {
             console.warn('[syncGateway] error en prebuffer predictivo', {
                 roomId,
@@ -305,12 +298,144 @@ const checkAndPrebufferNextTrack = async (io, roomId, state) => {
     }
 };
 
+const sendFastSyncWithStreamUrl = async ({
+                                             socket,
+                                             roomId,
+                                             state,
+                                             initialServerTimeMs,
+                                             joinLatency,
+                                         }) => {
+    try {
+        const streamUrl = await resolveStreamUrl(state.trackId);
+
+        if (streamUrl) {
+            const updatedNow = Date.now();
+            const updatedPositionMs = Math.floor(
+                RedisService.computeCurrentPosition(state, updatedNow),
+            );
+
+            const fastSyncLatency = updatedNow - initialServerTimeMs;
+
+            socket.emit('fastSync', {
+                trackId: state.trackId,
+                streamUrl,
+                positionMs: updatedPositionMs,
+                playbackState: state.playbackState || 'paused',
+                serverTimeMs: updatedNow,
+                networkLatency: joinLatency,
+                serverProcessingMs: fastSyncLatency,
+                version: state.version ?? 0,
+            });
+
+            if (process.env.LOG_LEVEL === 'debug') {
+                console.log('[syncGateway] fastSync enviado con streamUrl', {
+                    requestId: getRequestId(),
+                    roomId,
+                    userId: socket.userId,
+                    trackId: state.trackId,
+                    totalLatencyMs: fastSyncLatency,
+                });
+            }
+        } else {
+            console.warn('[syncGateway] No se pudo resolver streamUrl', {
+                roomId,
+                trackId: state.trackId,
+            });
+        }
+    } catch (error) {
+        console.error('[syncGateway] Error resolviendo streamUrl', {
+            roomId,
+            trackId: state.trackId,
+            error: error.message,
+        });
+    }
+};
+
+const shouldSkipSyncForRoom = (roomId, now, recentSeeks) => {
+    const lastSeek = recentSeeks.get(roomId);
+    if (!lastSeek) {
+        return false;
+    }
+
+    const timeSinceSeek = now - lastSeek;
+
+    if (timeSinceSeek >= 2000) {
+        return false;
+    }
+
+    if (process.env.LOG_LEVEL === 'debug') {
+        console.log('[syncGateway] syncPacket_skipped', {
+            roomId,
+            reason: 'recent_seek',
+            timeSinceSeek,
+        });
+    }
+
+    return true;
+};
+
+const getSyncDecision = (state, now) => {
+    const lastSync = state.lastSyncMs || 0;
+    const timeSinceLastSync = now - lastSync;
+    const SYNC_INTERVAL_MS = Number.parseInt(
+        process.env.SYNC_INTERVAL_MS || '1000',
+        10,
+    );
+
+    const shouldSync =
+        state.playbackState === 'playing' ||
+        timeSinceLastSync >= SYNC_INTERVAL_MS * 5 ||
+        state.version <= 3;
+
+    return { shouldSync, timeSinceLastSync };
+};
+
+const emitRoomSyncPacket = async ({
+                                      io,
+                                      roomId,
+                                      state,
+                                      now,
+                                      localSize,
+                                      timeSinceLastSync,
+                                  }) => {
+    const positionMs = Math.floor(
+        RedisService.computeCurrentPosition(state, now),
+    );
+
+    io.to(roomChannel(roomId)).emit('syncPacket', {
+        roomId,
+        serverTimeMs: now,
+        playbackState: state.playbackState || 'paused',
+        positionMs,
+        trackId: state.trackId ?? null,
+        version: state.version ?? 0,
+    });
+
+    await RedisService.setRoomState(roomId, {
+        ...state,
+        lastSyncMs: now,
+    });
+
+    if (process.env.ENABLE_PREBUFFER === 'true') {
+        await checkAndPrebufferNextTrack(io, roomId, state);
+    }
+
+    if (state.version % 30 === 0 || state.version < 3) {
+        console.log('[syncGateway] syncPacket', {
+            roomId,
+            users: localSize,
+            state: state.playbackState,
+            version: state.version,
+            timeSinceLastSync,
+        });
+    }
+};
+
 export function initSyncGateway(httpServer, { cors } = {}) {
-    // ✅ CORS por defecto para Socket.IO
     const defaultCors = {
         origin: toArray(process.env.CORS_ORIGIN) || '*',
         methods: ['GET', 'POST'],
-        credentials: false, // clave: no usamos cookies en el socket
+        credentials: false,
     };
 
     const finalCors = {
@@ -322,8 +447,7 @@ export function initSyncGateway(httpServer, { cors } = {}) {
     const io = new SocketIOServer(httpServer, { cors: finalCors });
     const activeRooms = new Set();
 
-    // ✅ OPTIMIZACIÓN: Map para trackear seeks recientes (ventana post-seek)
-    const recentSeeks = new Map(); // roomId -> timestamp
+    const recentSeeks = new Map();
 
     let controlUnsubscribe = null;
     let syncInterval = null;
@@ -360,17 +484,7 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                 continue;
             }
 
-            // ✅ No enviar syncPacket si hay seek reciente (ventana de 2s)
-            const lastSeek = recentSeeks.get(roomId);
-            if (lastSeek && now - lastSeek < 2000) {
-                // ✅ Log solo en modo debug para no saturar logs
-                if (process.env.LOG_LEVEL === 'debug') {
-                    console.log('[syncGateway] syncPacket_skipped', {
-                        roomId,
-                        reason: 'recent_seek',
-                        timeSinceSeek: now - lastSeek,
-                    });
-                }
+            if (shouldSkipSyncForRoom(roomId, now, recentSeeks)) {
                 continue;
             }
 
@@ -381,53 +495,23 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     continue;
                 }
 
-                // ✅ OPTIMIZACIÓN: Throttling basado en estado
-                const lastSync = state.lastSyncMs || 0;
-                const timeSinceLastSync = now - lastSync;
-                const SYNC_INTERVAL_MS = parseInt(process.env.SYNC_INTERVAL_MS || '1000', 10);
-
-                const shouldSync =
-                    state.playbackState === 'playing' || // Siempre sync si está reproduciendo
-                    timeSinceLastSync >= SYNC_INTERVAL_MS * 5 || // O cada 5s si pausado
-                    state.version <= 3; // O en las primeras sincronizaciones
+                const { shouldSync, timeSinceLastSync } = getSyncDecision(
+                    state,
+                    now,
+                );
 
                 if (!shouldSync) {
                     continue;
                 }
 
-                const positionMs = Math.floor(
-                    RedisService.computeCurrentPosition(state, now),
-                );
-
-                io.to(roomChannel(roomId)).emit('syncPacket', {
+                await emitRoomSyncPacket({
+                    io,
                     roomId,
-                    serverTimeMs: now,
-                    playbackState: state.playbackState || 'paused',
-                    positionMs,
-                    trackId: state.trackId ?? null,
-                    version: state.version ?? 0,
+                    state,
+                    now,
+                    localSize,
+                    timeSinceLastSync,
                 });
-
-                // Actualizar lastSyncMs en Redis
-                await RedisService.setRoomState(roomId, {
-                    ...state,
-                    lastSyncMs: now,
-                });
-
-                // ✅ Check para prebuffering
-                if (process.env.ENABLE_PREBUFFER === 'true') {
-                    await checkAndPrebufferNextTrack(io, roomId, state);
-                }
-
-                if (state.version % 30 === 0 || state.version < 3) {
-                    console.log('[syncGateway] syncPacket', {
-                        roomId,
-                        users: localSize,
-                        state: state.playbackState,
-                        version: state.version,
-                        timeSinceLastSync,
-                    });
-                }
             } catch (error) {
                 console.error(
                     `Failed to emit syncPacket for room ${roomId}`,
@@ -473,9 +557,6 @@ export function initSyncGateway(httpServer, { cors } = {}) {
     };
 
     const registerSocketHandlers = (socket) => {
-        // 🔐 Nuevo flujo de auth:
-        // - Tomamos accessToken del handshake (socket.handshake.auth.token / accessToken)
-        // - Lo usamos en AuthService.ensureCanControlPlayback (queue-service + Cognito)
         const rawAuth = socket.handshake.auth || {};
         const accessToken =
             rawAuth.token || rawAuth.accessToken || null;
@@ -491,8 +572,6 @@ export function initSyncGateway(httpServer, { cors } = {}) {
 
         socket.data.accessToken = accessToken;
 
-        // userId lógico solo para logs / métricas.
-        // En las operaciones de control usamos el user_id real devuelto por queue-service.
         const resolvedUserId =
             rawAuth.userId ||
             socket.handshake.query?.userId ||
@@ -529,16 +608,14 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     serverJoinTimestamp: now,
                 });
 
-                // ✅ OPTIMIZACIÓN: Enviar initialSync inmediato
                 try {
                     const state = await RedisService.getRoomState(roomId);
 
                     if (state && state.trackId) {
                         const positionMs = Math.floor(
-                            RedisService.computeCurrentPosition(state, now)
+                            RedisService.computeCurrentPosition(state, now),
                         );
 
-                        // Emitir solo a este socket específico
                         socket.emit('initialSync', {
                             roomId,
                             serverTimeMs: now,
@@ -557,56 +634,13 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                             playbackState: state.playbackState,
                         });
 
-                        // ✅ OPTIMIZACIÓN ULTRA-RÁPIDA: Pre-resolver streamUrl y enviar fastSync
-                        // Esto se hace en paralelo, sin bloquear initialSync
-                        (async () => {
-                            try {
-                                const streamUrl = await resolveStreamUrl(state.trackId);
-
-                                if (streamUrl) {
-                                    // Recalcular posición actualizada
-                                    const updatedNow = Date.now();
-                                    const updatedPositionMs = Math.floor(
-                                        RedisService.computeCurrentPosition(state, updatedNow)
-                                    );
-
-                                    const fastSyncLatency = updatedNow - now;
-
-                                    // Enviar fastSync con streamUrl pre-resuelta
-                                    socket.emit('fastSync', {
-                                        trackId: state.trackId,
-                                        streamUrl, // ✅ URL ya resuelta por el servidor
-                                        positionMs: updatedPositionMs,
-                                        playbackState: state.playbackState || 'paused',
-                                        serverTimeMs: updatedNow,
-                                        networkLatency: joinLatency,
-                                        serverProcessingMs: fastSyncLatency,
-                                        version: state.version ?? 0,
-                                    });
-
-                                    if (process.env.LOG_LEVEL === 'debug') {
-                                        console.log('[syncGateway] fastSync enviado con streamUrl', {
-                                            requestId: getRequestId(),
-                                            roomId,
-                                            userId: socket.userId,
-                                            trackId: state.trackId,
-                                            totalLatencyMs: fastSyncLatency,
-                                        });
-                                    }
-                                } else {
-                                    console.warn('[syncGateway] No se pudo resolver streamUrl', {
-                                        roomId,
-                                        trackId: state.trackId,
-                                    });
-                                }
-                            } catch (error) {
-                                console.error('[syncGateway] Error resolviendo streamUrl', {
-                                    roomId,
-                                    trackId: state.trackId,
-                                    error: error.message,
-                                });
-                            }
-                        })();
+                        sendFastSyncWithStreamUrl({
+                            socket,
+                            roomId,
+                            state,
+                            initialServerTimeMs: now,
+                            joinLatency,
+                        });
                     }
                 } catch (error) {
                     console.error('[syncGateway] error enviando initialSync', {
@@ -617,7 +651,6 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     });
                 }
 
-                // Notificar a otros usuarios después del initialSync
                 try {
                     io.to(channel).emit('roomUserJoin', {
                         roomId,
@@ -701,13 +734,11 @@ export function initSyncGateway(httpServer, { cors } = {}) {
             }),
         );
 
-        // ✅ OPTIMIZACIÓN: Handler de medición de latencia
         socket.on(
             'measureLatency',
             withWsRequestId(({ clientTimestamp } = {}) => {
                 const serverTimestamp = Date.now();
 
-                // ✅ Calcular RTT aproximado
                 const rtt = serverTimestamp - clientTimestamp;
 
                 socket.emit('latencyResponse', {
@@ -715,7 +746,6 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                     serverTimestamp,
                 });
 
-                // ✅ Logging solo en debug mode o si RTT es alto
                 if (process.env.LOG_LEVEL === 'debug' || rtt > 500) {
                     const logLevel = rtt > 500 ? 'warn' : 'log';
                     console[logLevel]('[syncGateway] latency_measurement', {
@@ -731,113 +761,124 @@ export function initSyncGateway(httpServer, { cors } = {}) {
             }),
         );
 
-        // ✅ OPTIMIZACIÓN: Handler fastCommand para comandos ultra-rápidos
         socket.on(
             'fastCommand',
-            withWsRequestId(async ({
-                type,
-                roomId,
-                positionMs,
-                clientTimestamp,
-                trackId,
-                userId
-            } = {}) => {
-                const serverReceiveTime = Date.now();
-                const networkLatency = clientTimestamp ? serverReceiveTime - clientTimestamp : null;
+            withWsRequestId(
+                async ({
+                           type,
+                           roomId,
+                           positionMs,
+                           clientTimestamp,
+                           trackId,
+                           userId,
+                       } = {}) => {
+                    const serverReceiveTime = Date.now();
+                    const networkLatency = clientTimestamp
+                        ? serverReceiveTime - clientTimestamp
+                        : null;
 
-                // Validaciones básicas
-                if (!isValidRoomId(roomId) || !type) {
-                    return;
-                }
-
-                if (process.env.LOG_LEVEL === 'debug') {
-                    console.log('[syncGateway] ⚡ fastCommand recibido', {
-                        requestId: getRequestId(),
-                        type,
-                        roomId,
-                        userId: socket.userId,
-                        networkLatencyMs: networkLatency,
-                    });
-                }
-
-                try {
-                    // Ejecutar comando según el tipo
-                    let result;
-                    const effectiveUserId = socket.userId;
-
-                    if (type === 'play') {
-                        result = await SyncDomainService.play({
-                            roomId,
-                            userId: effectiveUserId,
-                            trackId: trackId || '',
-                            startPositionMs: positionMs || 0,
-                        });
-                    } else if (type === 'pause') {
-                        result = await SyncDomainService.pause({
-                            roomId,
-                            userId: effectiveUserId,
-                        });
-                    } else if (type === 'seek') {
-                        result = await SyncDomainService.seek({
-                            roomId,
-                            userId: effectiveUserId,
-                            positionMs: positionMs || 0,
-                        });
-                    } else {
-                        console.warn('[syncGateway] fastCommand tipo desconocido:', type);
+                    if (!isValidRoomId(roomId) || !type) {
                         return;
                     }
 
-                    const totalLatency = Date.now() - serverReceiveTime;
-
-                    // Emitir fastSync a todos los clientes en la sala
-                    io.to(roomChannel(roomId)).emit('fastSync', {
-                        type,
-                        positionMs: positionMs || 0,
-                        trackId: trackId || null,
-                        serverTimeMs: Date.now(),
-                        originalClientTimestamp: clientTimestamp,
-                        version: result?.version ?? null,
-                    });
-
-                    // Confirmar al cliente que envió el comando
-                    socket.emit('controlAck', {
-                        action: type,
-                        roomId,
-                        version: result?.version ?? null,
-                        serverLatencyMs: totalLatency,
-                    });
-
-                    if (process.env.LOG_LEVEL === 'debug' || totalLatency > 100) {
-                        const logLevel = totalLatency > 100 ? 'warn' : 'log';
-                        console[logLevel]('[syncGateway] ✓ fastCommand procesado', {
+                    if (process.env.LOG_LEVEL === 'debug') {
+                        console.log('[syncGateway] fastCommand recibido', {
                             requestId: getRequestId(),
                             type,
                             roomId,
                             userId: socket.userId,
-                            totalLatencyMs: totalLatency,
                             networkLatencyMs: networkLatency,
                         });
                     }
-                } catch (error) {
-                    const totalLatency = Date.now() - serverReceiveTime;
 
-                    console.error('[syncGateway] error en fastCommand', {
-                        requestId: getRequestId(),
-                        type,
-                        roomId,
-                        userId: socket.userId,
-                        error: error.message,
-                        latencyMs: totalLatency,
-                    });
+                    try {
+                        let result;
+                        const effectiveUserId = socket.userId;
 
-                    socket.emit('controlError', {
-                        action: type,
-                        roomId,
-                        error: 'internal_error',
-                    });
-                }
-            }),
+                        if (type === 'play') {
+                            result = await SyncDomainService.play({
+                                roomId,
+                                userId: effectiveUserId,
+                                trackId: trackId || '',
+                                startPositionMs: positionMs || 0,
+                            });
+                        } else if (type === 'pause') {
+                            result = await SyncDomainService.pause({
+                                roomId,
+                                userId: effectiveUserId,
+                            });
+                        } else if (type === 'seek') {
+                            result = await SyncDomainService.seek({
+                                roomId,
+                                userId: effectiveUserId,
+                                positionMs: positionMs || 0,
+                            });
+                        } else {
+                            console.warn(
+                                '[syncGateway] fastCommand tipo desconocido:',
+                                type,
+                            );
+                            return;
+                        }
+
+                        const totalLatency = Date.now() - serverReceiveTime;
+
+                        io.to(roomChannel(roomId)).emit('fastSync', {
+                            type,
+                            positionMs: positionMs || 0,
+                            trackId: trackId || null,
+                            serverTimeMs: Date.now(),
+                            originalClientTimestamp: clientTimestamp,
+                            version: result?.version ?? null,
+                        });
+
+                        socket.emit('controlAck', {
+                            action: type,
+                            roomId,
+                            version: result?.version ?? null,
+                            serverLatencyMs: totalLatency,
+                        });
+
+                        if (
+                            process.env.LOG_LEVEL === 'debug' ||
+                            totalLatency > 100
+                        ) {
+                            const logLevel = totalLatency > 100 ? 'warn' : 'log';
+                            console[logLevel](
+                                '[syncGateway] fastCommand procesado',
+                                {
+                                    requestId: getRequestId(),
+                                    type,
+                                    roomId,
+                                    userId: socket.userId,
+                                    totalLatencyMs: totalLatency,
+                                    networkLatencyMs: networkLatency,
+                                },
+                            );
+                        }
+                    } catch (error) {
+                        const totalLatency = Date.now() - serverReceiveTime;
+
+                        console.error(
+                            '[syncGateway] error en fastCommand',
+                            {
+                                requestId: getRequestId(),
+                                type,
+                                roomId,
+                                userId: socket.userId,
+                                error: error.message,
+                                latencyMs: totalLatency,
+                            },
+                        );
+
+                        socket.emit('controlError', {
+                            action: type,
+                            roomId,
+                            error: 'internal_error',
+                        });
+                    }
+                },
+            ),
         );
 
         socket.on(
@@ -854,7 +895,6 @@ export function initSyncGateway(httpServer, { cors } = {}) {
             }),
         );
 
-        // PLAY
         socket.on(
             'play',
             withWsRequestId(
@@ -882,7 +922,6 @@ export function initSyncGateway(httpServer, { cors } = {}) {
             ),
         );
 
-        // PAUSE
         socket.on(
             'pause',
             withWsRequestId(async ({ roomId } = {}) => {
@@ -900,7 +939,6 @@ export function initSyncGateway(httpServer, { cors } = {}) {
             }),
         );
 
-        // SEEK
         socket.on(
             'seek',
             withWsRequestId(async ({ roomId, positionMs } = {}) => {
@@ -914,10 +952,8 @@ export function initSyncGateway(httpServer, { cors } = {}) {
                         Number.isFinite(positionMs) &&
                         positionMs >= 0,
                     domainCall: async (userId) => {
-                        // ✅ Marcar seek reciente para pausar syncPackets
                         recentSeeks.set(roomId, Date.now());
 
-                        // Limpiar después de 2s
                         setTimeout(() => recentSeeks.delete(roomId), 2000);
 
                         return await SyncDomainService.seek({
@@ -930,7 +966,6 @@ export function initSyncGateway(httpServer, { cors } = {}) {
             }),
         );
 
-        // CHANGE TRACK
         socket.on(
             'changeTrack',
             withWsRequestId(
