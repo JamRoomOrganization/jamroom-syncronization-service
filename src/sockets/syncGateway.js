@@ -13,6 +13,28 @@ import { pubClient, subClient } from '../config/redis.js';
 import { enforceRoomRateLimit } from '../utils/rateLimiter.js';
 import { withWsRequestId, getRequestId } from '../utils/requestLogger.js';
 import { toArray } from '../utils/toArray.js';
+import { VoiceState } from '../voice/voiceState.js';
+import { voiceServiceConfig } from '../config/voiceServiceConfig.js';
+import {
+    createOrUpdateVoiceSession,
+    deleteVoiceSession,
+    serverMuteUser,
+    serverUnmuteUser,
+    kickUserFromVoice,
+    getRoomPolicy,
+    VoiceError,
+    VoiceErrorCode,
+} from '../services/voiceSessionsClient.js';
+import {
+    VoiceErrors,
+    wrapAsVoiceError,
+} from '../voice/voiceErrors.js';
+import {
+    recordModerationEventReceived,
+    recordModerationSuccess,
+    recordModerationError,
+    logModeration,
+} from '../utils/voiceModerationMetrics.js';
 
 const CONTROL_CHANNEL_PATTERN = 'room:*:control';
 const roomChannel = (roomId) => `room:${roomId}`;
@@ -24,6 +46,8 @@ const AUTH_BYPASS = process.env.AUTH_BYPASS === 'true';
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 const ENABLE_PREBUFFER = process.env.ENABLE_PREBUFFER === 'true';
 const ALLOW_SINGLE_NODE = process.env.ALLOW_SINGLE_NODE === 'true';
+const ENABLE_VOICE = process.env.JAMROOM_ENABLE_VOICE === 'true';
+const ENABLE_VOICE_MEDIA = ENABLE_VOICE && process.env.JAMROOM_ENABLE_VOICE_MEDIA === 'true';
 
 const CONTROL_LIMITS = {
     play: { max: 10, windowMs: 3000 },
@@ -57,6 +81,59 @@ const emitControlError = (socket, action, roomId, error) => {
         action,
         roomId,
         error,
+    });
+};
+
+/**
+ * Emits a standardized voice:error event with VoiceError codes
+ * 
+ * @param {Socket} socket - Socket.IO socket
+ * @param {string} errorCode - Error code from VoiceErrorCode
+ * @param {Object} [options] - Additional options
+ * @param {string} [options.action] - Action that triggered the error (join, leave, mute, etc.)
+ * @param {string} [options.roomId] - Associated room ID
+ * @param {string} [options.targetUserId] - Target user ID (for moderation actions)
+ * @param {Record<string, unknown>} [options.context] - Additional context
+ */
+const emitVoiceError = (socket, errorCode, options = {}) => {
+    const errorDef = VoiceErrors[errorCode] || VoiceErrors[VoiceErrorCode.VOICE_INTERNAL_ERROR];
+    
+    socket.emit('voice:error', {
+        code: errorDef.code,
+        message: errorDef.message,
+        uiMessage: errorDef.uiMessage,
+        retryable: errorDef.retryable,
+        action: options.action,
+        roomId: options.roomId,
+        ...(options.targetUserId && { targetUserId: options.targetUserId }),
+        ...(options.context && { context: options.context }),
+    });
+};
+
+/**
+ * Emits a voice:error from a caught VoiceError or wraps unknown errors
+ * 
+ * @param {Socket} socket - Socket.IO socket
+ * @param {Error} err - The error that was caught
+ * @param {Object} [options] - Additional options (action, roomId, etc.)
+ */
+const emitVoiceErrorFromException = (socket, err, options = {}) => {
+    // If it's already a VoiceError, use its payload
+    if (err instanceof VoiceError) {
+        socket.emit('voice:error', {
+            ...err.toSocketPayload(),
+            action: options.action,
+            ...(options.targetUserId && { targetUserId: options.targetUserId }),
+        });
+        return;
+    }
+    
+    // Wrap unknown errors and emit
+    const wrapped = wrapAsVoiceError(err, { roomId: options.roomId });
+    socket.emit('voice:error', {
+        ...wrapped.toSocketPayload(),
+        action: options.action,
+        ...(options.targetUserId && { targetUserId: options.targetUserId }),
     });
 };
 
@@ -1050,6 +1127,65 @@ export function initSyncGateway(httpServer, options) {
                     roomCount: rooms.length,
                 });
 
+                // Handle voice cleanup on disconnect (if voice is enabled)
+                if (ENABLE_VOICE) {
+                    // Get all voice sessions for this user (includes sessionIds)
+                    const voiceSessions = VoiceState.getSessionsForUser(socket.userId);
+                    
+                    if (voiceSessions.length > 0) {
+                        console.log('[voice] disconnect: cleaning up voice sessions', {
+                            requestId: getRequestId(),
+                            socketId: socket.id,
+                            userId: socket.userId,
+                            rooms: voiceSessions.map(s => s.roomId),
+                        });
+                    }
+                    
+                    for (const { roomId, sessionId } of voiceSessions) {
+                        // Delete session from chatVoice-service (best-effort, ignore errors)
+                        if (sessionId) {
+                            deleteVoiceSession(sessionId, { requestId: getRequestId() }).catch((err) => {
+                                console.error('[voice] disconnect: failed to delete voice session', {
+                                    requestId: getRequestId(),
+                                    socketId: socket.id,
+                                    sessionId,
+                                    error: err.message,
+                                });
+                            });
+                        }
+                        
+                        const leaveResult = VoiceState.leaveVoice(roomId, socket.userId);
+                        if (leaveResult.success) {
+                            console.log('[voice] leave (disconnect)', {
+                                requestId: getRequestId(),
+                                socketId: socket.id,
+                                roomId,
+                                userId: socket.userId,
+                                reason: 'disconnect',
+                            });
+                            const voiceState = VoiceState.getVoiceState(roomId);
+                            io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+                        }
+                    }
+                    
+                    // Also check for any rooms without sessions (backwards compatibility)
+                    const voiceRoomsWithoutSessions = VoiceState.getRoomsForUser(socket.userId);
+                    for (const roomId of voiceRoomsWithoutSessions) {
+                        const leaveResult = VoiceState.leaveVoice(roomId, socket.userId);
+                        if (leaveResult.success) {
+                            console.log('[voice] leave (disconnect, no session)', {
+                                requestId: getRequestId(),
+                                socketId: socket.id,
+                                roomId,
+                                userId: socket.userId,
+                                reason: 'disconnect',
+                            });
+                            const voiceState = VoiceState.getVoiceState(roomId);
+                            io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+                        }
+                    }
+                }
+
                 for (const roomId of rooms) {
                     Metrics.userLeave(roomId, socket.userId);
 
@@ -1079,6 +1215,766 @@ export function initSyncGateway(httpServer, options) {
                 socket.joinedRooms.clear();
             }),
         );
+
+        // *********** Voice state handlers (feature flag gated) ***********
+        if (ENABLE_VOICE) {
+            socket.on(
+                'voice:join',
+                withWsRequestId(async ({ roomId, userId: payloadUserId } = {}) => {
+                    const correlationId = getRequestId();
+                    
+                    if (!isValidRoomId(roomId)) {
+                        emitVoiceError(socket, VoiceErrorCode.VOICE_INVALID_ROOM_ID, {
+                            action: 'join',
+                        });
+                        return;
+                    }
+
+                    // Validate user is in the room
+                    if (!socket.joinedRooms.has(roomId)) {
+                        emitVoiceError(socket, VoiceErrorCode.VOICE_NOT_IN_ROOM, {
+                            action: 'join',
+                            roomId,
+                        });
+                        return;
+                    }
+
+                    const effectiveUserId = payloadUserId || socket.userId;
+                    
+                    // Check if voice service is available for LiveKit integration
+                    if (!voiceServiceConfig.isAvailable) {
+                        console.warn('[voice] join: voice service unavailable', {
+                            requestId: correlationId,
+                            socketId: socket.id,
+                            roomId,
+                            userId: effectiveUserId,
+                        });
+                        emitVoiceError(socket, VoiceErrorCode.VOICE_SERVICE_UNAVAILABLE, {
+                            action: 'join',
+                            roomId,
+                        });
+                        return;
+                    }
+                    
+                    // Determine user's role (for policy checks)
+                    let userRole = 'listener';
+                    let isHostOrCohost = false;
+                    
+                    if (!AUTH_BYPASS) {
+                        try {
+                            const membership = await AuthService.ensureCanControlPlayback({
+                                accessToken: socket.data?.accessToken,
+                                roomId,
+                            });
+                            // User has host/cohost permissions
+                            isHostOrCohost = true;
+                            userRole = membership.roles?.includes('host') ? 'host' : 'cohost';
+                        } catch (err) {
+                            // User doesn't have host/cohost permissions - that's OK for joining
+                            // They'll be a regular speaker/listener
+                            isHostOrCohost = false;
+                            userRole = 'speaker';
+                        }
+                    } else {
+                        // AUTH_BYPASS: assume speaker role
+                        userRole = 'speaker';
+                    }
+                    
+                    // Fetch room policy (maxSpeakers, hostOnlyMode)
+                    const roomPolicy = await getRoomPolicy(roomId, { requestId: correlationId });
+                    
+                    // Check hostOnlyMode - only hosts/cohosts can speak
+                    let canPublishAudio = true;
+                    
+                    if (roomPolicy.hostOnlyMode && !isHostOrCohost) {
+                        // In hostOnlyMode, non-hosts join as listeners (can't speak)
+                        canPublishAudio = false;
+                        userRole = 'listener';
+                        
+                        console.log('[voice] join: hostOnlyMode active, user joining as listener', {
+                            requestId: correlationId,
+                            socketId: socket.id,
+                            roomId,
+                            userId: effectiveUserId,
+                        });
+                    }
+                    
+                    // Check maxSpeakers limit
+                    if (canPublishAudio && roomPolicy.maxSpeakers !== null) {
+                        const currentSpeakers = VoiceState.countSpeakers(roomId);
+                        
+                        if (currentSpeakers >= roomPolicy.maxSpeakers) {
+                            // Max speakers reached, user joins as listener
+                            canPublishAudio = false;
+                            userRole = 'listener';
+                            
+                            console.log('[voice] join: maxSpeakers limit reached, user joining as listener', {
+                                requestId: correlationId,
+                                socketId: socket.id,
+                                roomId,
+                                userId: effectiveUserId,
+                                currentSpeakers,
+                                maxSpeakers: roomPolicy.maxSpeakers,
+                            });
+                        }
+                    }
+
+                    // Call chatVoice-service to create/update voice session
+                    let voiceSession;
+                    try {
+                        const username = socket.data?.user?.username || undefined;
+                        voiceSession = await createOrUpdateVoiceSession({
+                            roomId,
+                            userId: effectiveUserId,
+                            username,
+                            canPublishAudio,
+                            canSubscribe: true,
+                            requestId: correlationId,
+                        });
+                    } catch (err) {
+                        console.error('[voice] join: failed to create voice session', {
+                            requestId: correlationId,
+                            socketId: socket.id,
+                            roomId,
+                            userId: effectiveUserId,
+                            error: err.message,
+                            code: err.code,
+                        });
+                        emitVoiceErrorFromException(socket, err, {
+                            action: 'join',
+                            roomId,
+                        });
+                        return;
+                    }
+
+                    // Join voice locally with role and canPublishAudio
+                    const result = VoiceState.joinVoice(roomId, effectiveUserId, {
+                        role: userRole,
+                        canPublishAudio,
+                    });
+
+                    if (!result.success) {
+                        emitVoiceError(socket, VoiceErrorCode.VOICE_INTERNAL_ERROR, {
+                            action: 'join',
+                            roomId,
+                            context: { error: result.error },
+                        });
+                        return;
+                    }
+
+                    // Attach session ID to the participant
+                    if (voiceSession?.sessionId) {
+                        VoiceState.attachSession(roomId, effectiveUserId, voiceSession.sessionId);
+                    }
+
+                    const voiceState = VoiceState.getVoiceState(roomId);
+
+                    console.log('[voice] join: success', {
+                        requestId: correlationId,
+                        socketId: socket.id,
+                        roomId,
+                        userId: effectiveUserId,
+                        sessionId: voiceSession?.sessionId,
+                        role: userRole,
+                        canPublishAudio,
+                    });
+
+                    // Emit to all users in the room
+                    io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+
+                    // Emit voice:session only to the joining user (for LiveKit connection)
+                    if (voiceSession) {
+                        socket.emit('voice:session', {
+                            sessionId: voiceSession.sessionId,
+                            roomId: voiceSession.roomId,
+                            userId: voiceSession.userId,
+                            livekit: voiceSession.livekit,
+                            role: userRole,
+                            canPublishAudio,
+                        });
+                    }
+                }),
+            );
+
+            socket.on(
+                'voice:leave',
+                withWsRequestId(async ({ roomId, userId: payloadUserId } = {}) => {
+                    if (!isValidRoomId(roomId)) {
+                        socket.emit('voice:error', {
+                            action: 'leave',
+                            error: 'invalid_room_id',
+                        });
+                        return;
+                    }
+
+                    const effectiveUserId = payloadUserId || socket.userId;
+                    const correlationId = getRequestId();
+                    
+                    // Get session ID before leaving voice
+                    const sessionId = VoiceState.getSessionId(roomId, effectiveUserId);
+                    
+                    // Delete session from chatVoice-service (best-effort)
+                    if (sessionId) {
+                        try {
+                            await deleteVoiceSession(sessionId, { requestId: correlationId });
+                            console.log('[voice] leave: deleted voice session', {
+                                requestId: correlationId,
+                                socketId: socket.id,
+                                sessionId,
+                            });
+                        } catch (err) {
+                            // Log but don't abort - continue with local cleanup
+                            console.error('[voice] leave: failed to delete voice session', {
+                                requestId: correlationId,
+                                socketId: socket.id,
+                                sessionId,
+                                error: err.message,
+                            });
+                        }
+                    }
+                    
+                    const result = VoiceState.leaveVoice(roomId, effectiveUserId);
+
+                    if (!result.success) {
+                        socket.emit('voice:error', {
+                            action: 'leave',
+                            roomId,
+                            error: result.error,
+                        });
+                        return;
+                    }
+
+                    const voiceState = VoiceState.getVoiceState(roomId);
+
+                    console.log('[voice] leave: success', {
+                        requestId: correlationId,
+                        socketId: socket.id,
+                        roomId,
+                        userId: effectiveUserId,
+                    });
+
+                    // Emit to all users in the room
+                    io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+                }),
+            );
+
+            socket.on(
+                'voice:mute',
+                withWsRequestId(async ({ roomId, userId: payloadUserId, muted } = {}) => {
+                    if (!isValidRoomId(roomId)) {
+                        socket.emit('voice:error', {
+                            action: 'mute',
+                            error: 'invalid_room_id',
+                        });
+                        return;
+                    }
+
+                    if (typeof muted !== 'boolean') {
+                        socket.emit('voice:error', {
+                            action: 'mute',
+                            roomId,
+                            error: 'invalid_muted_value',
+                        });
+                        return;
+                    }
+
+                    const effectiveUserId = payloadUserId || socket.userId;
+                    const result = VoiceState.setMute(roomId, effectiveUserId, muted);
+
+                    if (!result.success) {
+                        socket.emit('voice:error', {
+                            action: 'mute',
+                            roomId,
+                            error: result.error,
+                        });
+                        return;
+                    }
+
+                    const voiceState = VoiceState.getVoiceState(roomId);
+
+                    console.log('[voice] mute: success', {
+                        requestId: getRequestId(),
+                        socketId: socket.id,
+                        roomId,
+                        userId: effectiveUserId,
+                        muted,
+                    });
+
+                    // Emit to all users in the room
+                    io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+                }),
+            );
+
+            // *********** Voice moderation handlers ***********
+            
+            /**
+             * voice:host-mute - Host/cohost server-mutes a user
+             * Requires host/cohost permissions via AuthService.ensureCanControlPlayback
+             */
+            socket.on(
+                'voice:host-mute',
+                withWsRequestId(async ({ roomId, targetUserId, reason } = {}) => {
+                    const correlationId = getRequestId();
+                    const startTime = Date.now();
+                    const eventType = 'host-mute';
+                    
+                    // Record event received
+                    recordModerationEventReceived(eventType);
+                    
+                    if (!isValidRoomId(roomId)) {
+                        socket.emit('voice:error', {
+                            action: 'host-mute',
+                            error: 'invalid_room_id',
+                        });
+                        return;
+                    }
+                    
+                    if (!targetUserId || typeof targetUserId !== 'string') {
+                        socket.emit('voice:error', {
+                            action: 'host-mute',
+                            roomId,
+                            error: 'invalid_target_user_id',
+                        });
+                        return;
+                    }
+                    
+                    // Validate the target user is in voice
+                    const targetParticipant = VoiceState.getParticipant(roomId, targetUserId);
+                    if (!targetParticipant) {
+                        recordModerationError(eventType, 'target_not_in_voice');
+                        logModeration('warn', {
+                            type: eventType,
+                            result: 'target_not_in_voice',
+                            roomId,
+                            targetUserId,
+                            moderatorUserId: socket.userId,
+                            requestId: correlationId,
+                            socketId: socket.id,
+                        });
+                        socket.emit('voice:error', {
+                            action: 'host-mute',
+                            roomId,
+                            error: 'target_not_in_voice',
+                        });
+                        return;
+                    }
+                    
+                    // Check host/cohost permission
+                    let moderatorUserId = socket.userId;
+                    if (!AUTH_BYPASS) {
+                        try {
+                            const membership = await AuthService.ensureCanControlPlayback({
+                                accessToken: socket.data?.accessToken,
+                                roomId,
+                            });
+                            moderatorUserId = membership.user_id || membership.userId || socket.userId;
+                        } catch (err) {
+                            recordModerationError(eventType, 'permission_denied');
+                            logModeration('warn', {
+                                type: eventType,
+                                result: 'permission_denied',
+                                roomId,
+                                targetUserId,
+                                moderatorUserId: socket.userId,
+                                requestId: correlationId,
+                                socketId: socket.id,
+                                error: err.message,
+                            });
+                            emitVoiceError(socket, VoiceErrorCode.VOICE_PERMISSION_DENIED, {
+                                action: 'host-mute',
+                                roomId,
+                                targetUserId,
+                            });
+                            return;
+                        }
+                    }
+                    
+                    // Call chatVoice-service to server-mute
+                    try {
+                        await serverMuteUser({
+                            roomId,
+                            targetUserId,
+                            moderatorUserId,
+                            reason,
+                            requestId: correlationId,
+                        });
+                    } catch (err) {
+                        recordModerationError(eventType, 'voice_service_error');
+                        logModeration('error', {
+                            type: eventType,
+                            result: 'voice_service_error',
+                            roomId,
+                            targetUserId,
+                            moderatorUserId,
+                            requestId: correlationId,
+                            socketId: socket.id,
+                            latencyMs: Date.now() - startTime,
+                            error: err.message,
+                        });
+                        emitVoiceErrorFromException(socket, err, {
+                            action: 'host-mute',
+                            roomId,
+                            targetUserId,
+                        });
+                        return;
+                    }
+                    
+                    // Update local voice state
+                    const result = VoiceState.setServerMuted(roomId, targetUserId, true);
+                    
+                    if (!result.success) {
+                        emitVoiceError(socket, VoiceErrorCode.VOICE_TARGET_NOT_IN_VOICE, {
+                            action: 'host-mute',
+                            roomId,
+                            targetUserId,
+                        });
+                        return;
+                    }
+                    
+                    const voiceState = VoiceState.getVoiceState(roomId);
+                    const latencyMs = Date.now() - startTime;
+                    
+                    // Record success and log
+                    recordModerationSuccess(eventType);
+                    logModeration('info', {
+                        type: eventType,
+                        result: 'success',
+                        roomId,
+                        targetUserId,
+                        moderatorUserId,
+                        requestId: correlationId,
+                        socketId: socket.id,
+                        latencyMs,
+                        reason,
+                    });
+                    
+                    // Emit updated voice state to all users in the room
+                    io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+                    
+                    // Emit moderation event to the affected user
+                    io.to(roomChannel(roomId)).emit('voice:moderation', {
+                        action: 'server-muted',
+                        roomId,
+                        targetUserId,
+                        moderatorUserId,
+                        reason,
+                    });
+                }),
+            );
+            
+            /**
+             * voice:host-unmute - Host/cohost removes server-mute from a user
+             * Requires host/cohost permissions via AuthService.ensureCanControlPlayback
+             */
+            socket.on(
+                'voice:host-unmute',
+                withWsRequestId(async ({ roomId, targetUserId } = {}) => {
+                    const correlationId = getRequestId();
+                    const startTime = Date.now();
+                    const eventType = 'host-unmute';
+                    
+                    // Record event received
+                    recordModerationEventReceived(eventType);
+                    
+                    if (!isValidRoomId(roomId)) {
+                        socket.emit('voice:error', {
+                            action: 'host-unmute',
+                            error: 'invalid_room_id',
+                        });
+                        return;
+                    }
+                    
+                    if (!targetUserId || typeof targetUserId !== 'string') {
+                        socket.emit('voice:error', {
+                            action: 'host-unmute',
+                            roomId,
+                            error: 'invalid_target_user_id',
+                        });
+                        return;
+                    }
+                    
+                    // Validate the target user is in voice
+                    const targetParticipant = VoiceState.getParticipant(roomId, targetUserId);
+                    if (!targetParticipant) {
+                        recordModerationError(eventType, 'target_not_in_voice');
+                        logModeration('warn', {
+                            type: eventType,
+                            result: 'target_not_in_voice',
+                            roomId,
+                            targetUserId,
+                            moderatorUserId: socket.userId,
+                            requestId: correlationId,
+                            socketId: socket.id,
+                        });
+                        socket.emit('voice:error', {
+                            action: 'host-unmute',
+                            roomId,
+                            error: 'target_not_in_voice',
+                        });
+                        return;
+                    }
+                    
+                    // Check host/cohost permission
+                    let moderatorUserId = socket.userId;
+                    if (!AUTH_BYPASS) {
+                        try {
+                            const membership = await AuthService.ensureCanControlPlayback({
+                                accessToken: socket.data?.accessToken,
+                                roomId,
+                            });
+                            moderatorUserId = membership.user_id || membership.userId || socket.userId;
+                        } catch (err) {
+                            recordModerationError(eventType, 'permission_denied');
+                            logModeration('warn', {
+                                type: eventType,
+                                result: 'permission_denied',
+                                roomId,
+                                targetUserId,
+                                moderatorUserId: socket.userId,
+                                requestId: correlationId,
+                                socketId: socket.id,
+                                error: err.message,
+                            });
+                            socket.emit('voice:error', {
+                                action: 'host-unmute',
+                                roomId,
+                                error: mapAuthErrorCodeToClientError(err.code),
+                            });
+                            return;
+                        }
+                    }
+                    
+                    // Call chatVoice-service to server-unmute
+                    try {
+                        await serverUnmuteUser({
+                            roomId,
+                            targetUserId,
+                            moderatorUserId,
+                            requestId: correlationId,
+                        });
+                    } catch (err) {
+                        recordModerationError(eventType, 'voice_service_error');
+                        logModeration('error', {
+                            type: eventType,
+                            result: 'voice_service_error',
+                            roomId,
+                            targetUserId,
+                            moderatorUserId,
+                            requestId: correlationId,
+                            socketId: socket.id,
+                            latencyMs: Date.now() - startTime,
+                            error: err.message,
+                        });
+                        socket.emit('voice:error', {
+                            action: 'host-unmute',
+                            roomId,
+                            error: 'voice_service_error',
+                        });
+                        return;
+                    }
+                    
+                    // Update local voice state
+                    const result = VoiceState.setServerMuted(roomId, targetUserId, false);
+                    
+                    if (!result.success) {
+                        socket.emit('voice:error', {
+                            action: 'host-unmute',
+                            roomId,
+                            error: result.error,
+                        });
+                        return;
+                    }
+                    
+                    const voiceState = VoiceState.getVoiceState(roomId);
+                    const latencyMs = Date.now() - startTime;
+                    
+                    // Record success and log
+                    recordModerationSuccess(eventType);
+                    logModeration('info', {
+                        type: eventType,
+                        result: 'success',
+                        roomId,
+                        targetUserId,
+                        moderatorUserId,
+                        requestId: correlationId,
+                        socketId: socket.id,
+                        latencyMs,
+                    });
+                    
+                    // Emit updated voice state to all users in the room
+                    io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+                    
+                    // Emit moderation event to the affected user
+                    io.to(roomChannel(roomId)).emit('voice:moderation', {
+                        action: 'server-unmuted',
+                        roomId,
+                        targetUserId,
+                        moderatorUserId,
+                    });
+                }),
+            );
+            
+            /**
+             * voice:host-kick - Host/cohost kicks a user from voice
+             * Requires host/cohost permissions via AuthService.ensureCanControlPlayback
+             */
+            socket.on(
+                'voice:host-kick',
+                withWsRequestId(async ({ roomId, targetUserId, reason } = {}) => {
+                    const correlationId = getRequestId();
+                    const startTime = Date.now();
+                    const eventType = 'host-kick';
+                    
+                    // Record event received
+                    recordModerationEventReceived(eventType);
+                    
+                    if (!isValidRoomId(roomId)) {
+                        socket.emit('voice:error', {
+                            action: 'host-kick',
+                            error: 'invalid_room_id',
+                        });
+                        return;
+                    }
+                    
+                    if (!targetUserId || typeof targetUserId !== 'string') {
+                        socket.emit('voice:error', {
+                            action: 'host-kick',
+                            roomId,
+                            error: 'invalid_target_user_id',
+                        });
+                        return;
+                    }
+                    
+                    // Validate the target user is in voice
+                    const targetParticipant = VoiceState.getParticipant(roomId, targetUserId);
+                    if (!targetParticipant) {
+                        recordModerationError(eventType, 'target_not_in_voice');
+                        logModeration('warn', {
+                            type: eventType,
+                            result: 'target_not_in_voice',
+                            roomId,
+                            targetUserId,
+                            moderatorUserId: socket.userId,
+                            requestId: correlationId,
+                            socketId: socket.id,
+                        });
+                        socket.emit('voice:error', {
+                            action: 'host-kick',
+                            roomId,
+                            error: 'target_not_in_voice',
+                        });
+                        return;
+                    }
+                    
+                    // Check host/cohost permission
+                    let moderatorUserId = socket.userId;
+                    if (!AUTH_BYPASS) {
+                        try {
+                            const membership = await AuthService.ensureCanControlPlayback({
+                                accessToken: socket.data?.accessToken,
+                                roomId,
+                            });
+                            moderatorUserId = membership.user_id || membership.userId || socket.userId;
+                        } catch (err) {
+                            recordModerationError(eventType, 'permission_denied');
+                            logModeration('warn', {
+                                type: eventType,
+                                result: 'permission_denied',
+                                roomId,
+                                targetUserId,
+                                moderatorUserId: socket.userId,
+                                requestId: correlationId,
+                                socketId: socket.id,
+                                error: err.message,
+                            });
+                            socket.emit('voice:error', {
+                                action: 'host-kick',
+                                roomId,
+                                error: mapAuthErrorCodeToClientError(err.code),
+                            });
+                            return;
+                        }
+                    }
+                    
+                    // Get session ID before kicking
+                    const sessionId = VoiceState.getSessionId(roomId, targetUserId);
+                    
+                    // Call chatVoice-service to kick user
+                    try {
+                        await kickUserFromVoice({
+                            roomId,
+                            targetUserId,
+                            moderatorUserId,
+                            reason,
+                            requestId: correlationId,
+                        });
+                    } catch (err) {
+                        recordModerationError(eventType, 'voice_service_error');
+                        logModeration('error', {
+                            type: eventType,
+                            result: 'voice_service_error',
+                            roomId,
+                            targetUserId,
+                            moderatorUserId,
+                            requestId: correlationId,
+                            socketId: socket.id,
+                            latencyMs: Date.now() - startTime,
+                            error: err.message,
+                        });
+                        socket.emit('voice:error', {
+                            action: 'host-kick',
+                            roomId,
+                            error: 'voice_service_error',
+                        });
+                        return;
+                    }
+                    
+                    // Remove from local voice state
+                    const result = VoiceState.leaveVoice(roomId, targetUserId);
+                    
+                    if (!result.success) {
+                        socket.emit('voice:error', {
+                            action: 'host-kick',
+                            roomId,
+                            error: result.error,
+                        });
+                        return;
+                    }
+                    
+                    const voiceState = VoiceState.getVoiceState(roomId);
+                    const latencyMs = Date.now() - startTime;
+                    
+                    // Record success and log
+                    recordModerationSuccess(eventType);
+                    logModeration('info', {
+                        type: eventType,
+                        result: 'success',
+                        roomId,
+                        targetUserId,
+                        moderatorUserId,
+                        requestId: correlationId,
+                        socketId: socket.id,
+                        latencyMs,
+                        reason,
+                    });
+                    
+                    // Emit updated voice state to all users in the room
+                    io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+                    
+                    // Emit moderation event (the kicked user will receive this and should disconnect from LiveKit)
+                    io.to(roomChannel(roomId)).emit('voice:moderation', {
+                        action: 'kicked',
+                        roomId,
+                        targetUserId,
+                        moderatorUserId,
+                        reason,
+                    });
+                }),
+            );
+            
+            // *********** end voice moderation handlers ***********
+        }
+        // *********** end voice state handlers ***********
     };
 
     const initialize = async () => {
