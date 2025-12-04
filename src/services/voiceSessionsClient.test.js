@@ -102,14 +102,17 @@ describe('voiceSessionsClient', () => {
                 'http://localhost:3002/api/v1/voice/sessions',
                 expect.objectContaining({
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: expect.objectContaining({
+                        'Content-Type': 'application/json',
+                        'x-internal-api-key': 'test_internal_key_789'
+                    }),
                     body: JSON.stringify({
                         roomId: 'room-1',
                         userId: 'user-1',
                         username: 'testuser',
                         canPublishAudio: true,
-                        canSubscribe: true,
-                    }),
+                        canSubscribe: true
+                    })
                 })
             );
         });
