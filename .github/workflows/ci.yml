@@ -1,0 +1,78 @@
+name: CI - Tests & SonarCloud
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+  pull_request:
+    branches:
+      - main
+      - master
+      - develop
+
+jobs:
+  build-test-sonar:
+    runs-on: ubuntu-latest
+
+    env:
+      NODE_ENV: test
+
+      REDIS_URL: redis://dummy:6379
+      REDISMODE: standalone
+      REDIS_TLS: false
+      REDLOCK_ENABLED: false  
+      LOCK_TTL_MS: 5000
+      
+      QUEUE_SERVICE_URL: http://localhost:9999
+      
+      CORS_ORIGIN: http://localhost:3000
+      
+      ENABLE_PREBUFFER: false  
+      SYNC_INTERVAL_MS: 100
+      LOG_LEVEL: error  
+      
+      JAMROOM_ENABLE_VOICE: true
+      JAMROOM_ENABLE_VOICE_MEDIA: true
+      
+      VOICE_SERVICE_BASE_URL: http://localhost:3002
+      VOICE_SERVICE_TIMEOUT_MS: 1000
+      
+      LIVEKIT_API_KEY: test_key_123
+      LIVEKIT_API_SECRET: test_secret_456
+      LIVEKIT_URL: wss://test.livekit.cloud
+      LIVEKIT_TOKEN_TTL_SECONDS: 3600
+      
+      INTERNAL_API_KEY: test_internal_key_789
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npm run test:ci
+        env:
+          CI: true
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@v2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectBaseDir: .
+          args: >
+            -Dsonar.organization=jamroomorganization
+            -Dsonar.projectKey=JamRoomOrganization_jamroom-syncronization-service

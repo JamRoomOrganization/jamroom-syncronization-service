@@ -27,6 +27,7 @@ describe('voiceSessionsClient', () => {
         // Reset modules to get fresh config
         jest.resetModules();
         mockFetch.mockReset();
+        mockFetch.mockClear();
         
         // Set default env
         process.env.VOICE_SERVICE_BASE_URL = 'http://localhost:3002';
@@ -46,6 +47,14 @@ describe('voiceSessionsClient', () => {
         getAllMetrics = client.getAllMetrics;
         resetMetrics = client.resetMetrics;
         VoiceServiceError = client.voiceSessionsClient.VoiceServiceError;
+
+        mockFetch.mockResolvedValue({
+            ok: true,
+            status: 201,
+            json: async () => mockVoiceSession,
+        });
+
+        jest.spyOn(console, 'log').mockImplementation(() => {});
         
         // Reset metrics for clean state
         resetMetrics();

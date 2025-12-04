@@ -6,13 +6,15 @@
   "main": "index.js",
   "scripts": {
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
+    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",
+    "test:ci": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage --forceExit --detectOpenHandles",
+    "test:verbose": "node --experimental-vm-modules node_modules/jest/bin/jest.js --verbose",
+    "test:single": "node --experimental-vm-modules node_modules/jest/bin/jest.js --testPathPattern=",
     "start": "node src/server.js",
     "dev": "nodemon --exec \"node -r dotenv/config src/server.js\"",
     "dev:local": "nodemon --exec \"node -r dotenv/config src/server.js dotenv_config_path=.env.local\"",
     "dev:railway": "nodemon src/server.js",
-    "test:valkey": "node src/testValkey.js",
-    "test:redis": "node src/testRedis.js",
-    "test:queue": "node src/testQueueClient.js",
     "setup:railway": "node scripts/setup-railway.js",
     "railway:logs": "railway logs",
     "railway:vars": "railway variables"
