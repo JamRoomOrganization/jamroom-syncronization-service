@@ -35,6 +35,24 @@ import {
     recordModerationError,
     logModeration,
 } from '../utils/voiceModerationMetrics.js';
+import {
+    recordJitterSample,
+    recordRttSample,
+    getEstimatedJitter,
+    getEstimatedRtt,
+    getConnectionQuality,
+    removeClient,
+} from '../utils/jitterBuffer.js';
+import {
+    emitVoiceStateThrottled,
+    cleanupRoomThrottle,
+    getAdaptiveThrottle,
+} from '../utils/voiceStateThrottle.js';
+import {
+    markDisconnected as markVoiceDisconnected,
+    handleReconnection as handleVoiceReconnection,
+} from '../utils/voiceReconnectionHandler.js';
+import { voiceServiceCircuit } from '../utils/circuitBreaker.js';
 
 const CONTROL_CHANNEL_PATTERN = 'room:*:control';
 const roomChannel = (roomId) => `room:${roomId}`;
@@ -313,14 +331,24 @@ export async function handleDriftReport(socket, payload = {}) {
     }
 
     const nowServerMs = Date.now();
+    const clientId = socket.id;
+
+    // Record jitter and RTT samples for adaptive sync
+    if (Number.isFinite(jitterMs) && jitterMs >= 0) {
+        recordJitterSample(clientId, jitterMs, clientLagMs);
+    }
+
+    // Use estimated values from jitter buffer for more stable corrections
+    const estimatedJitter = getEstimatedJitter(clientId) || jitterMs;
+    const estimatedLag = getEstimatedRtt(clientId) || clientLagMs;
 
     const decision = decideCorrection({
         localPositionMs,
         observedServerPositionMs,
         observedServerTimeMs,
         nowServerMs,
-        jitterMs,
-        clientLagMs,
+        jitterMs: estimatedJitter,
+        clientLagMs: estimatedLag,
     });
 
     if (Number.isFinite(decision.driftMs)) {
@@ -839,9 +867,15 @@ export function initSyncGateway(httpServer, options) {
                 const serverTimestamp = Date.now();
                 const rtt = serverTimestamp - clientTimestamp;
 
+                // Record RTT sample for adaptive sync
+                if (Number.isFinite(rtt) && rtt >= 0) {
+                    recordRttSample(socket.id, rtt);
+                }
+
                 socket.emit('latencyResponse', {
                     clientTimestamp,
                     serverTimestamp,
+                    connectionQuality: getConnectionQuality(socket.id),
                 });
 
                 if (LOG_LEVEL === 'debug' || rtt > 500) {
@@ -854,6 +888,7 @@ export function initSyncGateway(httpServer, options) {
                         serverTimestamp,
                         rttMs: rtt,
                         isHighLatency: rtt > 500,
+                        connectionQuality: getConnectionQuality(socket.id),
                     });
                 }
             }),
@@ -1119,13 +1154,17 @@ export function initSyncGateway(httpServer, options) {
             'disconnect',
             withWsRequestId(async () => {
                 const rooms = Array.from(socket.joinedRooms);
+                const correlationId = getRequestId();
 
                 console.log('[syncGateway] user_disconnected', {
-                    requestId: getRequestId(),
+                    requestId: correlationId,
                     socketId: socket.id,
                     userId: socket.userId,
                     roomCount: rooms.length,
                 });
+
+                // Clean up jitter buffer state for this client
+                removeClient(socket.id);
 
                 // Handle voice cleanup on disconnect (if voice is enabled)
                 if (ENABLE_VOICE) {
@@ -1134,7 +1173,7 @@ export function initSyncGateway(httpServer, options) {
                     
                     if (voiceSessions.length > 0) {
                         console.log('[voice] disconnect: cleaning up voice sessions', {
-                            requestId: getRequestId(),
+                            requestId: correlationId,
                             socketId: socket.id,
                             userId: socket.userId,
                             rooms: voiceSessions.map(s => s.roomId),
@@ -1142,11 +1181,17 @@ export function initSyncGateway(httpServer, options) {
                     }
                     
                     for (const { roomId, sessionId } of voiceSessions) {
+                        // Mark as disconnected for potential reconnection handling
+                        markVoiceDisconnected(roomId, socket.userId, {
+                            sessionId,
+                            requestId: correlationId,
+                        });
+
                         // Delete session from chatVoice-service (best-effort, ignore errors)
                         if (sessionId) {
-                            deleteVoiceSession(sessionId, { requestId: getRequestId() }).catch((err) => {
+                            deleteVoiceSession(sessionId, { requestId: correlationId }).catch((err) => {
                                 console.error('[voice] disconnect: failed to delete voice session', {
-                                    requestId: getRequestId(),
+                                    requestId: correlationId,
                                     socketId: socket.id,
                                     sessionId,
                                     error: err.message,
@@ -1157,14 +1202,18 @@ export function initSyncGateway(httpServer, options) {
                         const leaveResult = VoiceState.leaveVoice(roomId, socket.userId);
                         if (leaveResult.success) {
                             console.log('[voice] leave (disconnect)', {
-                                requestId: getRequestId(),
+                                requestId: correlationId,
                                 socketId: socket.id,
                                 roomId,
                                 userId: socket.userId,
                                 reason: 'disconnect',
                             });
+                            // Use throttled emission for voice:state
                             const voiceState = VoiceState.getVoiceState(roomId);
-                            io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+                            emitVoiceStateThrottled(io, roomId, voiceState, {
+                                immediate: true, // Immediate for leave events
+                                trigger: 'disconnect',
+                            });
                         }
                     }
                     
@@ -1174,14 +1223,17 @@ export function initSyncGateway(httpServer, options) {
                         const leaveResult = VoiceState.leaveVoice(roomId, socket.userId);
                         if (leaveResult.success) {
                             console.log('[voice] leave (disconnect, no session)', {
-                                requestId: getRequestId(),
+                                requestId: correlationId,
                                 socketId: socket.id,
                                 roomId,
                                 userId: socket.userId,
                                 reason: 'disconnect',
                             });
                             const voiceState = VoiceState.getVoiceState(roomId);
-                            io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+                            emitVoiceStateThrottled(io, roomId, voiceState, {
+                                immediate: true,
+                                trigger: 'disconnect',
+                            });
                         }
                     }
                 }
@@ -1379,8 +1431,11 @@ export function initSyncGateway(httpServer, options) {
                         canPublishAudio,
                     });
 
-                    // Emit to all users in the room
-                    io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+                    // Emit to all users in the room (immediate for join events)
+                    emitVoiceStateThrottled(io, roomId, voiceState, {
+                        immediate: true,
+                        trigger: 'join',
+                    });
 
                     // Emit voice:session only to the joining user (for LiveKit connection)
                     if (voiceSession) {
@@ -1453,8 +1508,11 @@ export function initSyncGateway(httpServer, options) {
                         userId: effectiveUserId,
                     });
 
-                    // Emit to all users in the room
-                    io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+                    // Emit to all users in the room (immediate for leave events)
+                    emitVoiceStateThrottled(io, roomId, voiceState, {
+                        immediate: true,
+                        trigger: 'leave',
+                    });
                 }),
             );
 
@@ -1500,8 +1558,12 @@ export function initSyncGateway(httpServer, options) {
                         muted,
                     });
 
-                    // Emit to all users in the room
-                    io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+                    // Emit to all users in the room (throttled for mute changes)
+                    const throttleMs = getAdaptiveThrottle(roomId);
+                    emitVoiceStateThrottled(io, roomId, voiceState, {
+                        throttleMs,
+                        trigger: 'mute',
+                    });
                 }),
             );
 
@@ -1648,8 +1710,11 @@ export function initSyncGateway(httpServer, options) {
                         reason,
                     });
                     
-                    // Emit updated voice state to all users in the room
-                    io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+                    // Emit updated voice state to all users in the room (immediate for moderation)
+                    emitVoiceStateThrottled(io, roomId, voiceState, {
+                        immediate: true,
+                        trigger: 'host-mute',
+                    });
                     
                     // Emit moderation event to the affected user
                     io.to(roomChannel(roomId)).emit('voice:moderation', {
@@ -1801,8 +1866,11 @@ export function initSyncGateway(httpServer, options) {
                         latencyMs,
                     });
                     
-                    // Emit updated voice state to all users in the room
-                    io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+                    // Emit updated voice state to all users in the room (immediate for moderation)
+                    emitVoiceStateThrottled(io, roomId, voiceState, {
+                        immediate: true,
+                        trigger: 'host-unmute',
+                    });
                     
                     // Emit moderation event to the affected user
                     io.to(roomChannel(roomId)).emit('voice:moderation', {
@@ -1958,8 +2026,11 @@ export function initSyncGateway(httpServer, options) {
                         reason,
                     });
                     
-                    // Emit updated voice state to all users in the room
-                    io.to(roomChannel(roomId)).emit('voice:state', voiceState);
+                    // Emit updated voice state to all users in the room (immediate for kick)
+                    emitVoiceStateThrottled(io, roomId, voiceState, {
+                        immediate: true,
+                        trigger: 'host-kick',
+                    });
                     
                     // Emit moderation event (the kicked user will receive this and should disconnect from LiveKit)
                     io.to(roomChannel(roomId)).emit('voice:moderation', {

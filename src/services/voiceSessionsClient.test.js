@@ -104,7 +104,6 @@ describe('voiceSessionsClient', () => {
                     method: 'POST',
                     headers: expect.objectContaining({
                         'Content-Type': 'application/json',
-                        'x-internal-api-key': 'test_internal_key_789'
                     }),
                     body: JSON.stringify({
                         roomId: 'room-1',

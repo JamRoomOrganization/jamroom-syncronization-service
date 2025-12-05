@@ -10,6 +10,7 @@
  * - Retry logic for read operations
  * - Timeout handling with AbortController
  * - Standardized error codes from voiceErrors catalog
+ * - Circuit breaker for graceful degradation
  */
 
 import { voiceServiceConfig } from '../config/voiceServiceConfig.js';
@@ -20,6 +21,8 @@ import {
     mapServiceErrorToVoiceErrorCode,
     wrapAsVoiceError,
 } from '../voice/voiceErrors.js';
+import { voiceServiceCircuit } from '../utils/circuitBreaker.js';
+import { retryWithBackoff, voiceServiceRetryOptions } from '../utils/retryWithBackoff.js';
 
 // ============================================================================
 // METRICS TRACKING
