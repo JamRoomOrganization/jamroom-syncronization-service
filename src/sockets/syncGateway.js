@@ -67,6 +67,14 @@ const ALLOW_SINGLE_NODE = process.env.ALLOW_SINGLE_NODE === 'true';
 const ENABLE_VOICE = process.env.JAMROOM_ENABLE_VOICE === 'true';
 const ENABLE_VOICE_MEDIA = ENABLE_VOICE && process.env.JAMROOM_ENABLE_VOICE_MEDIA === 'true';
 
+console.log('[syncGateway] Configuración de voz cargada:', {
+    JAMROOM_ENABLE_VOICE: process.env.JAMROOM_ENABLE_VOICE,
+    JAMROOM_ENABLE_VOICE_MEDIA: process.env.JAMROOM_ENABLE_VOICE_MEDIA,
+    CHATVOICE_SERVICE_URL: process.env.CHATVOICE_SERVICE_URL || process.env.VOICE_SERVICE_BASE_URL,
+    INTERNAL_API_KEY: process.env.INTERNAL_API_KEY ? 'SET' : 'NOT SET',
+    NODE_ENV: process.env.NODE_ENV
+});
+
 const CONTROL_LIMITS = {
     play: { max: 10, windowMs: 3000 },
     pause: { max: 10, windowMs: 3000 },
