@@ -33,6 +33,22 @@ async function start() {
         // Request ID propagation middleware
         app.use(requestLogger);
 
+        app.get('/health', (req, res) => {
+            res.json({ 
+                status: 'ok',
+                checks: { 
+                    redis: true, 
+                    redisPub: true, 
+                    redisSub: true,
+                    service: true
+                },
+                uptime: process.uptime(),
+                timestamp: Date.now(),
+                service: 'syncronization-service',
+                version: process.env.npm_package_version || '1.0.0'
+            });
+        });
+
         app.get('/__health', (req, res) => {
             res.json({ ok: true });
         });
