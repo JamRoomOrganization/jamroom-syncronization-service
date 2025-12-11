@@ -40,7 +40,7 @@ export const SyncDomainService = {
 
     async play({ roomId, userId, trackId, startPositionMs = 0, playbackRate = 1 }) {
         const lock = await RedisService.lockRoom(roomId);
-        const release = lock.release?.bind(lock);
+        const release = lock?.release?.bind(lock);
 
         try {
             const now = nowMs();
@@ -85,16 +85,18 @@ export const SyncDomainService = {
             return updatedState;
         } finally {
             if (typeof release === 'function') {
-                await release().catch((error) => {
+                try {
+                    await release();
+                } catch (error) {
                     console.warn(`Failed to release lock for room ${roomId}`, error);
-                });
+                }
             }
         }
     },
 
     async pause({ roomId, userId }) {
         const lock = await RedisService.lockRoom(roomId);
-        const release = lock.release?.bind(lock);
+        const release = lock?.release?.bind(lock);
 
         try {
             const now = nowMs();
@@ -103,7 +105,9 @@ export const SyncDomainService = {
                 throw new RoomNotFoundError(roomId);
             }
 
-            const positionMs = Math.floor(RedisService.computeCurrentPosition(previousState, now));
+            const positionMs = Math.floor(
+                RedisService.computeCurrentPosition(previousState, now),
+            );
             const version = await RedisService.nextVersion(roomId);
 
             const updatedState = {
@@ -134,16 +138,18 @@ export const SyncDomainService = {
             return updatedState;
         } finally {
             if (typeof release === 'function') {
-                await release().catch((error) => {
+                try {
+                    await release();
+                } catch (error) {
                     console.warn(`Failed to release lock for room ${roomId}`, error);
-                });
+                }
             }
         }
     },
 
     async seek({ roomId, userId, positionMs }) {
         const lock = await RedisService.lockRoom(roomId);
-        const release = lock.release?.bind(lock);
+        const release = lock?.release?.bind(lock);
 
         try {
             const now = nowMs();
@@ -152,7 +158,8 @@ export const SyncDomainService = {
                 throw new RoomNotFoundError(roomId);
             }
 
-            const sanitizedPosition = typeof positionMs === 'number' ? positionMs : 0;
+            const sanitizedPosition =
+                typeof positionMs === 'number' ? positionMs : 0;
             const version = await RedisService.nextVersion(roomId);
 
             const updatedState = {
@@ -181,16 +188,18 @@ export const SyncDomainService = {
             return updatedState;
         } finally {
             if (typeof release === 'function') {
-                await release().catch((error) => {
+                try {
+                    await release();
+                } catch (error) {
                     console.warn(`Failed to release lock for room ${roomId}`, error);
-                });
+                }
             }
         }
     },
 
     async changeTrack({ roomId, userId, trackId, startPositionMs = 0, playbackRate = 1 }) {
         const lock = await RedisService.lockRoom(roomId);
-        const release = lock.release?.bind(lock);
+        const release = lock?.release?.bind(lock);
 
         try {
             const now = nowMs();
@@ -208,9 +217,11 @@ export const SyncDomainService = {
                 version,
                 trackId: resolvedTrackId,
                 playbackState: 'playing',
-                basePositionMs: typeof startPositionMs === 'number' ? startPositionMs : 0,
+                basePositionMs:
+                    typeof startPositionMs === 'number' ? startPositionMs : 0,
                 baseServerTimeMs: now,
-                playbackRate: typeof playbackRate === 'number' ? playbackRate : 1,
+                playbackRate:
+                    typeof playbackRate === 'number' ? playbackRate : 1,
                 updatedByUserId: userId ?? null,
                 updatedAt: now,
             };
@@ -233,9 +244,11 @@ export const SyncDomainService = {
             return updatedState;
         } finally {
             if (typeof release === 'function') {
-                await release().catch((error) => {
+                try {
+                    await release();
+                } catch (error) {
                     console.warn(`Failed to release lock for room ${roomId}`, error);
-                });
+                }
             }
         }
     },

@@ -1,4 +1,3 @@
-// src/config/redis.js
 import { createClient, createCluster } from 'redis';
 import Redlock from 'redlock';
 import dotenv from 'dotenv';

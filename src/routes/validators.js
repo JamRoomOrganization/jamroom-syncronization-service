@@ -6,7 +6,7 @@ const isNonNegativeNumber = (value) =>
 
 const normalizePlaybackRate = (value) => {
     if (value === undefined) {
-        return 1;
+        return { ok: true, value: 1 };
     }
     if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
         return { ok: false, error: { field: 'playbackRate', reason: 'invalid' } };

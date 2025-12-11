@@ -1,4 +1,3 @@
-// src/services/queueMembershipClient.js
 import axios from 'axios';
 
 // Timeout duro en ms para no colgar el sync-service si Railway se demora

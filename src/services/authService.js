@@ -1,4 +1,3 @@
-// src/services/authService.js
 import { RedisService } from './redisService.js';
 import { queueMembershipClient } from './queueMembershipClient.js';
 import { isSafeId } from '../utils/idValidator.js';
