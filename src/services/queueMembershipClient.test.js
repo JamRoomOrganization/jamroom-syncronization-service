@@ -15,8 +15,10 @@ jest.unstable_mockModule('axios', () => ({
 // Importar el cliente después de mockear axios
 const { queueMembershipClient } = await import('./queueMembershipClient.js');
 
-// Base URL real que usa el módulo cuando no se define QUEUE_SERVICE_URL
-const BASE_URL = 'https://jamroom-queue-service-production.up.railway.app';
+// Base URL real que usa el módulo (respeta QUEUE_SERVICE_URL si está definida)
+const BASE_URL =
+  process.env.QUEUE_SERVICE_URL ||
+  'https://jamroom-queue-service-production.up.railway.app';
 
 describe('queueMembershipClient', () => {
   let warnSpy;

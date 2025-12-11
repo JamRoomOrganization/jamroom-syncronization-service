@@ -1,6 +1,10 @@
 import { jest } from '@jest/globals';
 import queueClient from './queueClient.js';
 
+// Base URL esperada según la misma lógica que usa queueClient internamente
+const EXPECTED_BASE_URL =
+  process.env.QUEUE_SERVICE_URL || 'http://localhost:3000';
+
 describe('queueClient helpers', () => {
   it('_normalizeBaseUrl maneja url inválida o vacía usando localhost', () => {
     const fn = queueClient._normalizeBaseUrl;
@@ -81,7 +85,7 @@ describe('queueClient HTTP methods', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, options] = fetchMock.mock.calls[0];
 
-    expect(url).toBe('http://localhost:3000/api/rooms');
+    expect(url).toBe(`${EXPECTED_BASE_URL}/api/rooms`);
     expect(options).toEqual({
       method: 'GET',
       headers: {
@@ -146,7 +150,7 @@ describe('queueClient HTTP methods', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, options] = fetchMock.mock.calls[0];
 
-    expect(url).toBe('http://localhost:3000/api/rooms');
+    expect(url).toBe(`${EXPECTED_BASE_URL}/api/rooms`);
     expect(options).toEqual({
       method: 'POST',
       headers: {
@@ -169,7 +173,9 @@ describe('queueClient HTTP methods', () => {
       text: textMock,
     });
 
-    await expect(queueClient.post('/api/rooms', { a: 1 })).rejects.toMatchObject({
+    await expect(
+      queueClient.post('/api/rooms', { a: 1 }),
+    ).rejects.toMatchObject({
       name: 'QueueServiceError',
       statusCode: 400,
       responseData: 'post-error',
@@ -210,7 +216,7 @@ describe('queueClient HTTP methods', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, options] = fetchMock.mock.calls[0];
 
-    expect(url).toBe('http://localhost:3000/api/rooms/room-1');
+    expect(url).toBe(`${EXPECTED_BASE_URL}/api/rooms/room-1`);
     expect(options).toEqual({
       method: 'DELETE',
       headers: {
@@ -255,3 +261,4 @@ describe('queueClient HTTP methods', () => {
     expect(consoleErrorSpy).toHaveBeenCalled();
   });
 });
+
