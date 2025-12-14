@@ -1497,6 +1497,24 @@ export function initSyncGateway(httpServer, options) {
 
                     const effectiveUserId = payloadUserId || socket.userId;
                     
+                    // DEFENSIVE VALIDATION: Ensure userId is a valid non-empty string
+                    // The chatVoice-service requires userId to be a string with min 1 char
+                    if (!effectiveUserId || typeof effectiveUserId !== 'string' || effectiveUserId.trim().length === 0) {
+                        console.warn('[voice] join: missing or invalid userId', {
+                            requestId: correlationId,
+                            socketId: socket.id,
+                            roomId,
+                            payloadUserId,
+                            socketUserId: socket.userId,
+                            effectiveUserId,
+                        });
+                        emitVoiceError(socket, VoiceErrorCode.VOICE_INVALID_USER_ID, {
+                            action: 'join',
+                            roomId,
+                        });
+                        return;
+                    }
+                    
                     // Check if voice service is available for LiveKit integration
                     if (!voiceServiceConfig.isAvailable) {
                         console.warn('[voice] join: voice service unavailable', {
@@ -1579,6 +1597,20 @@ export function initSyncGateway(httpServer, options) {
                     let voiceSession;
                     try {
                         const username = socket.data?.user?.username || undefined;
+                        
+                        // DEBUG: Log payload being sent to chatVoice-service
+                        console.log('[voice] join: calling createOrUpdateVoiceSession', {
+                            requestId: correlationId,
+                            socketId: socket.id,
+                            payload: {
+                                roomId,
+                                userId: effectiveUserId,
+                                username,
+                                canPublishAudio,
+                                canSubscribe: true,
+                            },
+                        });
+                        
                         voiceSession = await createOrUpdateVoiceSession({
                             roomId,
                             userId: effectiveUserId,
