@@ -60,32 +60,29 @@ const ensureMetrics = (operation) => {
 };
 
 /**
- * Records a successful operation
+ * Records an operation result (success or error)
  * @param {string} operation - Operation name
  * @param {number} latencyMs - Latency in milliseconds
+ * @param {boolean} isSuccess - Whether the operation was successful
  */
-const recordSuccess = (operation, latencyMs) => {
+const recordMetric = (operation, latencyMs, isSuccess) => {
     const metrics = ensureMetrics(operation);
-    metrics.successCount++;
+    if (isSuccess) {
+        metrics.successCount++;
+    } else {
+        metrics.errorCount++;
+    }
     metrics.latencies.push(latencyMs);
     if (metrics.latencies.length > MAX_LATENCY_SAMPLES) {
         metrics.latencies.shift();
     }
 };
 
-/**
- * Records a failed operation
- * @param {string} operation - Operation name
- * @param {number} latencyMs - Latency in milliseconds
- */
-const recordError = (operation, latencyMs) => {
-    const metrics = ensureMetrics(operation);
-    metrics.errorCount++;
-    metrics.latencies.push(latencyMs);
-    if (metrics.latencies.length > MAX_LATENCY_SAMPLES) {
-        metrics.latencies.shift();
-    }
-};
+/** Shorthand for recording success */
+const recordSuccess = (operation, latencyMs) => recordMetric(operation, latencyMs, true);
+
+/** Shorthand for recording error */
+const recordError = (operation, latencyMs) => recordMetric(operation, latencyMs, false);
 
 /**
  * Calculates percentile from sorted array
@@ -782,6 +779,90 @@ export async function listVoiceSessionsByRoom(roomId, { requestId, noRetry = fal
  */
 
 /**
+ * Generic helper for moderation POST operations
+ * Handles common patterns: service availability, fetch, success/error logging, metrics
+ * 
+ * @param {Object} params - Operation parameters
+ * @param {string} params.operationName - Operation name for metrics (e.g., 'server_mute')
+ * @param {string} params.endpoint - API endpoint path (e.g., '/api/v1/voice/moderation/server-mute')
+ * @param {Object} params.body - Request body to send
+ * @param {Object} params.context - Context for logging and errors (roomId, targetUserId, action)
+ * @param {string} [params.requestId] - Optional request ID for correlation
+ * @returns {Promise<ModerationResult>}
+ * @throws {VoiceError} If the service is unavailable or request fails
+ */
+async function executeModerationOperation({ operationName, endpoint, body, context, requestId }) {
+    const startTime = Date.now();
+    
+    ensureServiceAvailable();
+    
+    const url = `${voiceServiceConfig.baseUrl}${endpoint}`;
+    const { roomId, targetUserId, action } = context;
+    
+    try {
+        const response = await fetchWithTimeout(url, {
+            method: 'POST',
+            headers: getCommonHeaders({
+                'Content-Type': 'application/json',
+            }),
+            body: JSON.stringify(body),
+        });
+        
+        const latencyMs = Date.now() - startTime;
+        
+        if (response.ok) {
+            const responseBody = await response.json();
+            
+            recordSuccess(operationName, latencyMs);
+            log('info', {
+                op: operationName,
+                status: 'success',
+                roomId,
+                userId: targetUserId,
+                latencyMs,
+                requestId,
+            });
+            
+            return responseBody.data || { success: true };
+        }
+        
+        const errorText = await response.text();
+        
+        recordError(operationName, latencyMs);
+        log('error', {
+            op: operationName,
+            status: 'error',
+            roomId,
+            userId: targetUserId,
+            latencyMs,
+            error: `HTTP ${response.status}: ${errorText}`,
+            requestId,
+        });
+        
+        throw createVoiceErrorFromResponse(response.status, errorText, { roomId, userId: targetUserId, action });
+    } catch (err) {
+        const latencyMs = Date.now() - startTime;
+        
+        if (err instanceof VoiceError || err instanceof VoiceServiceError) {
+            throw err;
+        }
+        
+        recordError(operationName, latencyMs);
+        log('error', {
+            op: operationName,
+            status: 'error',
+            roomId,
+            userId: targetUserId,
+            latencyMs,
+            error: err.name === 'AbortError' ? 'timeout' : err.message,
+            requestId,
+        });
+        
+        throw wrapAsVoiceError(err, { roomId, userId: targetUserId, action });
+    }
+}
+
+/**
  * Server-mutes a user in a voice room (moderation action)
  * 
  * @param {Object} params - Moderation parameters
@@ -800,79 +881,13 @@ export async function serverMuteUser({
     reason,
     requestId,
 }) {
-    const OP = 'server_mute';
-    const startTime = Date.now();
-    
-    ensureServiceAvailable();
-    
-    const url = `${voiceServiceConfig.baseUrl}/api/v1/voice/moderation/server-mute`;
-    
-    try {
-        const response = await fetchWithTimeout(url, {
-            method: 'POST',
-            headers: getCommonHeaders({
-                'Content-Type': 'application/json',
-            }),
-            body: JSON.stringify({
-                roomId,
-                targetUserId,
-                moderatorUserId,
-                reason,
-            }),
-        });
-        
-        const latencyMs = Date.now() - startTime;
-        
-        if (response.ok) {
-            const body = await response.json();
-            
-            recordSuccess(OP, latencyMs);
-            log('info', {
-                op: OP,
-                status: 'success',
-                roomId,
-                userId: targetUserId,
-                latencyMs,
-                requestId,
-            });
-            
-            return body.data || { success: true };
-        }
-        
-        const errorText = await response.text();
-        
-        recordError(OP, latencyMs);
-        log('error', {
-            op: OP,
-            status: 'error',
-            roomId,
-            userId: targetUserId,
-            latencyMs,
-            error: `HTTP ${response.status}: ${errorText}`,
-            requestId,
-        });
-        
-        throw createVoiceErrorFromResponse(response.status, errorText, { roomId, userId: targetUserId, action: 'serverMute' });
-    } catch (err) {
-        const latencyMs = Date.now() - startTime;
-        
-        if (err instanceof VoiceError || err instanceof VoiceServiceError) {
-            throw err;
-        }
-        
-        recordError(OP, latencyMs);
-        log('error', {
-            op: OP,
-            status: 'error',
-            roomId,
-            userId: targetUserId,
-            latencyMs,
-            error: err.name === 'AbortError' ? 'timeout' : err.message,
-            requestId,
-        });
-        
-        throw wrapAsVoiceError(err, { roomId, userId: targetUserId, action: 'serverMute' });
-    }
+    return executeModerationOperation({
+        operationName: 'server_mute',
+        endpoint: '/api/v1/voice/moderation/server-mute',
+        body: { roomId, targetUserId, moderatorUserId, reason },
+        context: { roomId, targetUserId, action: 'serverMute' },
+        requestId,
+    });
 }
 
 /**
@@ -892,78 +907,13 @@ export async function serverUnmuteUser({
     moderatorUserId,
     requestId,
 }) {
-    const OP = 'server_unmute';
-    const startTime = Date.now();
-    
-    ensureServiceAvailable();
-    
-    const url = `${voiceServiceConfig.baseUrl}/api/v1/voice/moderation/server-unmute`;
-    
-    try {
-        const response = await fetchWithTimeout(url, {
-            method: 'POST',
-            headers: getCommonHeaders({
-                'Content-Type': 'application/json',
-            }),
-            body: JSON.stringify({
-                roomId,
-                targetUserId,
-                moderatorUserId,
-            }),
-        });
-        
-        const latencyMs = Date.now() - startTime;
-        
-        if (response.ok) {
-            const body = await response.json();
-            
-            recordSuccess(OP, latencyMs);
-            log('info', {
-                op: OP,
-                status: 'success',
-                roomId,
-                userId: targetUserId,
-                latencyMs,
-                requestId,
-            });
-            
-            return body.data || { success: true };
-        }
-        
-        const errorText = await response.text();
-        
-        recordError(OP, latencyMs);
-        log('error', {
-            op: OP,
-            status: 'error',
-            roomId,
-            userId: targetUserId,
-            latencyMs,
-            error: `HTTP ${response.status}: ${errorText}`,
-            requestId,
-        });
-        
-        throw createVoiceErrorFromResponse(response.status, errorText, { roomId, userId: targetUserId, action: 'serverUnmute' });
-    } catch (err) {
-        const latencyMs = Date.now() - startTime;
-        
-        if (err instanceof VoiceError || err instanceof VoiceServiceError) {
-            throw err;
-        }
-        
-        recordError(OP, latencyMs);
-        log('error', {
-            op: OP,
-            status: 'error',
-            roomId,
-            userId: targetUserId,
-            latencyMs,
-            error: err.name === 'AbortError' ? 'timeout' : err.message,
-            requestId,
-        });
-        
-        throw wrapAsVoiceError(err, { roomId, userId: targetUserId, action: 'serverUnmute' });
-    }
+    return executeModerationOperation({
+        operationName: 'server_unmute',
+        endpoint: '/api/v1/voice/moderation/server-unmute',
+        body: { roomId, targetUserId, moderatorUserId },
+        context: { roomId, targetUserId, action: 'serverUnmute' },
+        requestId,
+    });
 }
 
 /**
@@ -985,79 +935,13 @@ export async function kickUserFromVoice({
     reason,
     requestId,
 }) {
-    const OP = 'kick';
-    const startTime = Date.now();
-    
-    ensureServiceAvailable();
-    
-    const url = `${voiceServiceConfig.baseUrl}/api/v1/voice/moderation/kick`;
-    
-    try {
-        const response = await fetchWithTimeout(url, {
-            method: 'POST',
-            headers: getCommonHeaders({
-                'Content-Type': 'application/json',
-            }),
-            body: JSON.stringify({
-                roomId,
-                targetUserId,
-                moderatorUserId,
-                reason,
-            }),
-        });
-        
-        const latencyMs = Date.now() - startTime;
-        
-        if (response.ok) {
-            const body = await response.json();
-            
-            recordSuccess(OP, latencyMs);
-            log('info', {
-                op: OP,
-                status: 'success',
-                roomId,
-                userId: targetUserId,
-                latencyMs,
-                requestId,
-            });
-            
-            return body.data || { success: true };
-        }
-        
-        const errorText = await response.text();
-        
-        recordError(OP, latencyMs);
-        log('error', {
-            op: OP,
-            status: 'error',
-            roomId,
-            userId: targetUserId,
-            latencyMs,
-            error: `HTTP ${response.status}: ${errorText}`,
-            requestId,
-        });
-        
-        throw createVoiceErrorFromResponse(response.status, errorText, { roomId, userId: targetUserId, action: 'kick' });
-    } catch (err) {
-        const latencyMs = Date.now() - startTime;
-        
-        if (err instanceof VoiceError || err instanceof VoiceServiceError) {
-            throw err;
-        }
-        
-        recordError(OP, latencyMs);
-        log('error', {
-            op: OP,
-            status: 'error',
-            roomId,
-            userId: targetUserId,
-            latencyMs,
-            error: err.name === 'AbortError' ? 'timeout' : err.message,
-            requestId,
-        });
-        
-        throw wrapAsVoiceError(err, { roomId, userId: targetUserId, action: 'kick' });
-    }
+    return executeModerationOperation({
+        operationName: 'kick',
+        endpoint: '/api/v1/voice/moderation/kick',
+        body: { roomId, targetUserId, moderatorUserId, reason },
+        context: { roomId, targetUserId, action: 'kick' },
+        requestId,
+    });
 }
 
 /**

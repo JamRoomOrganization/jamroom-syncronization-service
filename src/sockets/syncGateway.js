@@ -163,6 +163,202 @@ const emitVoiceErrorFromException = (socket, err, options = {}) => {
     });
 };
 
+/**
+ * Validates moderation handler common parameters and permission
+ * Returns null if validation fails (error already emitted), or an object with validated data
+ * 
+ * @param {Object} params - Validation parameters
+ * @param {Socket} params.socket - Socket.IO socket
+ * @param {string} params.roomId - Room ID
+ * @param {string} params.targetUserId - Target user ID
+ * @param {string} params.action - Action name for error messages
+ * @param {string} params.eventType - Event type for metrics
+ * @param {string} params.correlationId - Request correlation ID
+ * @returns {Promise<{moderatorUserId: string, targetParticipant: Object}|null>}
+ */
+const validateModerationRequest = async ({
+    socket,
+    roomId,
+    targetUserId,
+    action,
+    eventType,
+    correlationId,
+}) => {
+    if (!isValidRoomId(roomId)) {
+        socket.emit('voice:error', {
+            action,
+            error: 'invalid_room_id',
+        });
+        return null;
+    }
+    
+    if (!targetUserId || typeof targetUserId !== 'string') {
+        socket.emit('voice:error', {
+            action,
+            roomId,
+            error: 'invalid_target_user_id',
+        });
+        return null;
+    }
+    
+    // Validate the target user is in voice
+    const targetParticipant = VoiceState.getParticipant(roomId, targetUserId);
+    if (!targetParticipant) {
+        recordModerationError(eventType, 'target_not_in_voice');
+        logModeration('warn', {
+            type: eventType,
+            result: 'target_not_in_voice',
+            roomId,
+            targetUserId,
+            moderatorUserId: socket.userId,
+            requestId: correlationId,
+            socketId: socket.id,
+        });
+        socket.emit('voice:error', {
+            action,
+            roomId,
+            error: 'target_not_in_voice',
+        });
+        return null;
+    }
+    
+    // Check host/cohost permission
+    let moderatorUserId = socket.userId;
+    if (!AUTH_BYPASS) {
+        try {
+            const membership = await AuthService.ensureCanControlPlayback({
+                accessToken: socket.data?.accessToken,
+                roomId,
+            });
+            moderatorUserId = membership.user_id || membership.userId || socket.userId;
+        } catch (err) {
+            recordModerationError(eventType, 'permission_denied');
+            logModeration('warn', {
+                type: eventType,
+                result: 'permission_denied',
+                roomId,
+                targetUserId,
+                moderatorUserId: socket.userId,
+                requestId: correlationId,
+                socketId: socket.id,
+                error: err.message,
+            });
+            // Use emitVoiceError for host-mute, simple emit for others (backwards compatibility)
+            if (action === 'host-mute') {
+                emitVoiceError(socket, VoiceErrorCode.VOICE_PERMISSION_DENIED, {
+                    action,
+                    roomId,
+                    targetUserId,
+                });
+            } else {
+                socket.emit('voice:error', {
+                    action,
+                    roomId,
+                    error: mapAuthErrorCodeToClientError(err.code),
+                });
+            }
+            return null;
+        }
+    }
+    
+    return { moderatorUserId, targetParticipant };
+};
+
+/**
+ * Handles voice service errors for moderation actions
+ * 
+ * @param {Object} params - Error handling parameters
+ */
+const handleModerationServiceError = ({
+    socket,
+    action,
+    eventType,
+    roomId,
+    targetUserId,
+    moderatorUserId,
+    correlationId,
+    startTime,
+    err,
+}) => {
+    recordModerationError(eventType, 'voice_service_error');
+    logModeration('error', {
+        type: eventType,
+        result: 'voice_service_error',
+        roomId,
+        targetUserId,
+        moderatorUserId,
+        requestId: correlationId,
+        socketId: socket.id,
+        latencyMs: Date.now() - startTime,
+        error: err.message,
+    });
+    
+    // Use emitVoiceErrorFromException for host-mute, simple emit for others
+    if (action === 'host-mute') {
+        emitVoiceErrorFromException(socket, err, {
+            action,
+            roomId,
+            targetUserId,
+        });
+    } else {
+        socket.emit('voice:error', {
+            action,
+            roomId,
+            error: 'voice_service_error',
+        });
+    }
+};
+
+/**
+ * Logs and broadcasts successful moderation action
+ * 
+ * @param {Object} params - Success handling parameters
+ */
+const finalizeModerationSuccess = ({
+    io,
+    socket,
+    action,
+    eventType,
+    roomId,
+    targetUserId,
+    moderatorUserId,
+    correlationId,
+    startTime,
+    reason,
+    moderationAction, // 'server-muted', 'server-unmuted', 'kicked'
+}) => {
+    const voiceState = VoiceState.getVoiceState(roomId);
+    const latencyMs = Date.now() - startTime;
+    
+    recordModerationSuccess(eventType);
+    logModeration('info', {
+        type: eventType,
+        result: 'success',
+        roomId,
+        targetUserId,
+        moderatorUserId,
+        requestId: correlationId,
+        socketId: socket.id,
+        latencyMs,
+        ...(reason && { reason }),
+    });
+    
+    // Emit updated voice state to all users in the room (immediate for moderation)
+    emitVoiceStateThrottled(io, roomId, voiceState, {
+        immediate: true,
+        trigger: action,
+    });
+    
+    // Emit moderation event to the affected user
+    io.to(roomChannel(roomId)).emit('voice:moderation', {
+        action: moderationAction,
+        roomId,
+        targetUserId,
+        moderatorUserId,
+        ...(reason && { reason }),
+    });
+};
+
 const mapAuthErrorCodeToClientError = (code) => {
     switch (code) {
         case 'MEMBERSHIP_NOT_FOUND':
@@ -1587,77 +1783,22 @@ export function initSyncGateway(httpServer, options) {
                     const correlationId = getRequestId();
                     const startTime = Date.now();
                     const eventType = 'host-mute';
+                    const action = 'host-mute';
                     
-                    // Record event received
                     recordModerationEventReceived(eventType);
                     
-                    if (!isValidRoomId(roomId)) {
-                        socket.emit('voice:error', {
-                            action: 'host-mute',
-                            error: 'invalid_room_id',
-                        });
-                        return;
-                    }
+                    const validation = await validateModerationRequest({
+                        socket,
+                        roomId,
+                        targetUserId,
+                        action,
+                        eventType,
+                        correlationId,
+                    });
                     
-                    if (!targetUserId || typeof targetUserId !== 'string') {
-                        socket.emit('voice:error', {
-                            action: 'host-mute',
-                            roomId,
-                            error: 'invalid_target_user_id',
-                        });
-                        return;
-                    }
+                    if (!validation) return;
                     
-                    // Validate the target user is in voice
-                    const targetParticipant = VoiceState.getParticipant(roomId, targetUserId);
-                    if (!targetParticipant) {
-                        recordModerationError(eventType, 'target_not_in_voice');
-                        logModeration('warn', {
-                            type: eventType,
-                            result: 'target_not_in_voice',
-                            roomId,
-                            targetUserId,
-                            moderatorUserId: socket.userId,
-                            requestId: correlationId,
-                            socketId: socket.id,
-                        });
-                        socket.emit('voice:error', {
-                            action: 'host-mute',
-                            roomId,
-                            error: 'target_not_in_voice',
-                        });
-                        return;
-                    }
-                    
-                    // Check host/cohost permission
-                    let moderatorUserId = socket.userId;
-                    if (!AUTH_BYPASS) {
-                        try {
-                            const membership = await AuthService.ensureCanControlPlayback({
-                                accessToken: socket.data?.accessToken,
-                                roomId,
-                            });
-                            moderatorUserId = membership.user_id || membership.userId || socket.userId;
-                        } catch (err) {
-                            recordModerationError(eventType, 'permission_denied');
-                            logModeration('warn', {
-                                type: eventType,
-                                result: 'permission_denied',
-                                roomId,
-                                targetUserId,
-                                moderatorUserId: socket.userId,
-                                requestId: correlationId,
-                                socketId: socket.id,
-                                error: err.message,
-                            });
-                            emitVoiceError(socket, VoiceErrorCode.VOICE_PERMISSION_DENIED, {
-                                action: 'host-mute',
-                                roomId,
-                                targetUserId,
-                            });
-                            return;
-                        }
-                    }
+                    const { moderatorUserId } = validation;
                     
                     // Call chatVoice-service to server-mute
                     try {
@@ -1669,22 +1810,16 @@ export function initSyncGateway(httpServer, options) {
                             requestId: correlationId,
                         });
                     } catch (err) {
-                        recordModerationError(eventType, 'voice_service_error');
-                        logModeration('error', {
-                            type: eventType,
-                            result: 'voice_service_error',
+                        handleModerationServiceError({
+                            socket,
+                            action,
+                            eventType,
                             roomId,
                             targetUserId,
                             moderatorUserId,
-                            requestId: correlationId,
-                            socketId: socket.id,
-                            latencyMs: Date.now() - startTime,
-                            error: err.message,
-                        });
-                        emitVoiceErrorFromException(socket, err, {
-                            action: 'host-mute',
-                            roomId,
-                            targetUserId,
+                            correlationId,
+                            startTime,
+                            err,
                         });
                         return;
                     }
@@ -1694,43 +1829,25 @@ export function initSyncGateway(httpServer, options) {
                     
                     if (!result.success) {
                         emitVoiceError(socket, VoiceErrorCode.VOICE_TARGET_NOT_IN_VOICE, {
-                            action: 'host-mute',
+                            action,
                             roomId,
                             targetUserId,
                         });
                         return;
                     }
                     
-                    const voiceState = VoiceState.getVoiceState(roomId);
-                    const latencyMs = Date.now() - startTime;
-                    
-                    // Record success and log
-                    recordModerationSuccess(eventType);
-                    logModeration('info', {
-                        type: eventType,
-                        result: 'success',
+                    finalizeModerationSuccess({
+                        io,
+                        socket,
+                        action,
+                        eventType,
                         roomId,
                         targetUserId,
                         moderatorUserId,
-                        requestId: correlationId,
-                        socketId: socket.id,
-                        latencyMs,
+                        correlationId,
+                        startTime,
                         reason,
-                    });
-                    
-                    // Emit updated voice state to all users in the room (immediate for moderation)
-                    emitVoiceStateThrottled(io, roomId, voiceState, {
-                        immediate: true,
-                        trigger: 'host-mute',
-                    });
-                    
-                    // Emit moderation event to the affected user
-                    io.to(roomChannel(roomId)).emit('voice:moderation', {
-                        action: 'server-muted',
-                        roomId,
-                        targetUserId,
-                        moderatorUserId,
-                        reason,
+                        moderationAction: 'server-muted',
                     });
                 }),
             );
@@ -1745,77 +1862,22 @@ export function initSyncGateway(httpServer, options) {
                     const correlationId = getRequestId();
                     const startTime = Date.now();
                     const eventType = 'host-unmute';
+                    const action = 'host-unmute';
                     
-                    // Record event received
                     recordModerationEventReceived(eventType);
                     
-                    if (!isValidRoomId(roomId)) {
-                        socket.emit('voice:error', {
-                            action: 'host-unmute',
-                            error: 'invalid_room_id',
-                        });
-                        return;
-                    }
+                    const validation = await validateModerationRequest({
+                        socket,
+                        roomId,
+                        targetUserId,
+                        action,
+                        eventType,
+                        correlationId,
+                    });
                     
-                    if (!targetUserId || typeof targetUserId !== 'string') {
-                        socket.emit('voice:error', {
-                            action: 'host-unmute',
-                            roomId,
-                            error: 'invalid_target_user_id',
-                        });
-                        return;
-                    }
+                    if (!validation) return;
                     
-                    // Validate the target user is in voice
-                    const targetParticipant = VoiceState.getParticipant(roomId, targetUserId);
-                    if (!targetParticipant) {
-                        recordModerationError(eventType, 'target_not_in_voice');
-                        logModeration('warn', {
-                            type: eventType,
-                            result: 'target_not_in_voice',
-                            roomId,
-                            targetUserId,
-                            moderatorUserId: socket.userId,
-                            requestId: correlationId,
-                            socketId: socket.id,
-                        });
-                        socket.emit('voice:error', {
-                            action: 'host-unmute',
-                            roomId,
-                            error: 'target_not_in_voice',
-                        });
-                        return;
-                    }
-                    
-                    // Check host/cohost permission
-                    let moderatorUserId = socket.userId;
-                    if (!AUTH_BYPASS) {
-                        try {
-                            const membership = await AuthService.ensureCanControlPlayback({
-                                accessToken: socket.data?.accessToken,
-                                roomId,
-                            });
-                            moderatorUserId = membership.user_id || membership.userId || socket.userId;
-                        } catch (err) {
-                            recordModerationError(eventType, 'permission_denied');
-                            logModeration('warn', {
-                                type: eventType,
-                                result: 'permission_denied',
-                                roomId,
-                                targetUserId,
-                                moderatorUserId: socket.userId,
-                                requestId: correlationId,
-                                socketId: socket.id,
-                                error: err.message,
-                            });
-                            socket.emit('voice:error', {
-                                action: 'host-unmute',
-                                roomId,
-                                error: mapAuthErrorCodeToClientError(err.code),
-                            });
-                            return;
-                        }
-                    }
+                    const { moderatorUserId } = validation;
                     
                     // Call chatVoice-service to server-unmute
                     try {
@@ -1826,22 +1888,16 @@ export function initSyncGateway(httpServer, options) {
                             requestId: correlationId,
                         });
                     } catch (err) {
-                        recordModerationError(eventType, 'voice_service_error');
-                        logModeration('error', {
-                            type: eventType,
-                            result: 'voice_service_error',
+                        handleModerationServiceError({
+                            socket,
+                            action,
+                            eventType,
                             roomId,
                             targetUserId,
                             moderatorUserId,
-                            requestId: correlationId,
-                            socketId: socket.id,
-                            latencyMs: Date.now() - startTime,
-                            error: err.message,
-                        });
-                        socket.emit('voice:error', {
-                            action: 'host-unmute',
-                            roomId,
-                            error: 'voice_service_error',
+                            correlationId,
+                            startTime,
+                            err,
                         });
                         return;
                     }
@@ -1851,41 +1907,24 @@ export function initSyncGateway(httpServer, options) {
                     
                     if (!result.success) {
                         socket.emit('voice:error', {
-                            action: 'host-unmute',
+                            action,
                             roomId,
                             error: result.error,
                         });
                         return;
                     }
                     
-                    const voiceState = VoiceState.getVoiceState(roomId);
-                    const latencyMs = Date.now() - startTime;
-                    
-                    // Record success and log
-                    recordModerationSuccess(eventType);
-                    logModeration('info', {
-                        type: eventType,
-                        result: 'success',
+                    finalizeModerationSuccess({
+                        io,
+                        socket,
+                        action,
+                        eventType,
                         roomId,
                         targetUserId,
                         moderatorUserId,
-                        requestId: correlationId,
-                        socketId: socket.id,
-                        latencyMs,
-                    });
-                    
-                    // Emit updated voice state to all users in the room (immediate for moderation)
-                    emitVoiceStateThrottled(io, roomId, voiceState, {
-                        immediate: true,
-                        trigger: 'host-unmute',
-                    });
-                    
-                    // Emit moderation event to the affected user
-                    io.to(roomChannel(roomId)).emit('voice:moderation', {
-                        action: 'server-unmuted',
-                        roomId,
-                        targetUserId,
-                        moderatorUserId,
+                        correlationId,
+                        startTime,
+                        moderationAction: 'server-unmuted',
                     });
                 }),
             );
@@ -1900,80 +1939,19 @@ export function initSyncGateway(httpServer, options) {
                     const correlationId = getRequestId();
                     const startTime = Date.now();
                     const eventType = 'host-kick';
+                    const action = 'host-kick';
                     
                     // Record event received
                     recordModerationEventReceived(eventType);
                     
-                    if (!isValidRoomId(roomId)) {
-                        socket.emit('voice:error', {
-                            action: 'host-kick',
-                            error: 'invalid_room_id',
-                        });
-                        return;
-                    }
+                    // Validate input
+                    const validation = validateModerationInput({ socket, roomId, targetUserId, eventType, correlationId });
+                    if (!validation.valid) return;
                     
-                    if (!targetUserId || typeof targetUserId !== 'string') {
-                        socket.emit('voice:error', {
-                            action: 'host-kick',
-                            roomId,
-                            error: 'invalid_target_user_id',
-                        });
-                        return;
-                    }
-                    
-                    // Validate the target user is in voice
-                    const targetParticipant = VoiceState.getParticipant(roomId, targetUserId);
-                    if (!targetParticipant) {
-                        recordModerationError(eventType, 'target_not_in_voice');
-                        logModeration('warn', {
-                            type: eventType,
-                            result: 'target_not_in_voice',
-                            roomId,
-                            targetUserId,
-                            moderatorUserId: socket.userId,
-                            requestId: correlationId,
-                            socketId: socket.id,
-                        });
-                        socket.emit('voice:error', {
-                            action: 'host-kick',
-                            roomId,
-                            error: 'target_not_in_voice',
-                        });
-                        return;
-                    }
-                    
-                    // Check host/cohost permission
-                    let moderatorUserId = socket.userId;
-                    if (!AUTH_BYPASS) {
-                        try {
-                            const membership = await AuthService.ensureCanControlPlayback({
-                                accessToken: socket.data?.accessToken,
-                                roomId,
-                            });
-                            moderatorUserId = membership.user_id || membership.userId || socket.userId;
-                        } catch (err) {
-                            recordModerationError(eventType, 'permission_denied');
-                            logModeration('warn', {
-                                type: eventType,
-                                result: 'permission_denied',
-                                roomId,
-                                targetUserId,
-                                moderatorUserId: socket.userId,
-                                requestId: correlationId,
-                                socketId: socket.id,
-                                error: err.message,
-                            });
-                            socket.emit('voice:error', {
-                                action: 'host-kick',
-                                roomId,
-                                error: mapAuthErrorCodeToClientError(err.code),
-                            });
-                            return;
-                        }
-                    }
-                    
-                    // Get session ID before kicking
-                    const sessionId = VoiceState.getSessionId(roomId, targetUserId);
+                    // Check permission
+                    const permission = await getModerationPermission({ socket, roomId, targetUserId, eventType, correlationId });
+                    if (!permission.allowed) return;
+                    const moderatorUserId = permission.moderatorUserId;
                     
                     // Call chatVoice-service to kick user
                     try {
@@ -1998,7 +1976,7 @@ export function initSyncGateway(httpServer, options) {
                             error: err.message,
                         });
                         socket.emit('voice:error', {
-                            action: 'host-kick',
+                            action,
                             roomId,
                             error: 'voice_service_error',
                         });
@@ -2010,43 +1988,25 @@ export function initSyncGateway(httpServer, options) {
                     
                     if (!result.success) {
                         socket.emit('voice:error', {
-                            action: 'host-kick',
+                            action,
                             roomId,
                             error: result.error,
                         });
                         return;
                     }
                     
-                    const voiceState = VoiceState.getVoiceState(roomId);
-                    const latencyMs = Date.now() - startTime;
-                    
-                    // Record success and log
-                    recordModerationSuccess(eventType);
-                    logModeration('info', {
-                        type: eventType,
-                        result: 'success',
+                    // Handle success
+                    handleModerationSuccess({
+                        io,
+                        socket,
                         roomId,
                         targetUserId,
                         moderatorUserId,
-                        requestId: correlationId,
-                        socketId: socket.id,
-                        latencyMs,
+                        eventType,
+                        correlationId,
+                        startTime,
                         reason,
-                    });
-                    
-                    // Emit updated voice state to all users in the room (immediate for kick)
-                    emitVoiceStateThrottled(io, roomId, voiceState, {
-                        immediate: true,
-                        trigger: 'host-kick',
-                    });
-                    
-                    // Emit moderation event (the kicked user will receive this and should disconnect from LiveKit)
-                    io.to(roomChannel(roomId)).emit('voice:moderation', {
-                        action: 'kicked',
-                        roomId,
-                        targetUserId,
-                        moderatorUserId,
-                        reason,
+                        moderationAction: 'kicked',
                     });
                 }),
             );

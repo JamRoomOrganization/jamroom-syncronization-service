@@ -68,6 +68,62 @@ const getBaseUrl = () => {
 };
 
 /**
+ * Ejecuta una petición HTTP genérica con manejo de errores unificado
+ * @param {string} method - HTTP method (GET, POST, DELETE)
+ * @param {string} path - API path
+ * @param {Object} options - Request options (headers, accessToken)
+ * @param {*} [body] - Request body (for POST)
+ * @returns {Promise<Response>}
+ */
+async function request(method, path, options = {}, body = undefined) {
+  const normalizedPath = normalizePath(path);
+  const url = `${getBaseUrl()}${normalizedPath}`;
+
+  console.log(`[queueClient] ${method} ${url}`);
+
+  const headers = {
+    'Content-Type': 'application/json',
+    ...options.headers,
+  };
+
+  if (options.accessToken) {
+    headers.Authorization = `Bearer ${options.accessToken}`;
+  }
+
+  const fetchOptions = { method, headers };
+  if (body !== undefined) {
+    fetchOptions.body = JSON.stringify(body);
+  }
+
+  try {
+    const response = await fetch(url, fetchOptions);
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new QueueServiceError(
+        `Queue service error: ${response.status}`,
+        response.status,
+        text
+      );
+    }
+
+    return response;
+  } catch (error) {
+    if (error instanceof QueueServiceError) {
+      throw error;
+    }
+
+    console.error(`[queueClient] ${method} ${url} failed:`, error.message);
+
+    throw new QueueServiceError(
+      'Queue service unavailable',
+      0,
+      { originalError: error.message }
+    );
+  }
+}
+
+/**
  * Cliente HTTP para queue-service
  */
 const queueClient = {
@@ -75,148 +131,21 @@ const queueClient = {
    * GET request
    */
   async get(path, options = {}) {
-    const normalizedPath = normalizePath(path);
-    const url = `${getBaseUrl()}${normalizedPath}`;
-
-    console.log(`[queueClient] GET ${url}`);
-
-    const headers = {
-      'Content-Type': 'application/json',
-      ...options.headers,
-    };
-
-    if (options.accessToken) {
-      headers.Authorization = `Bearer ${options.accessToken}`;
-    }
-
-    try {
-      const response = await fetch(url, {
-        method: 'GET',
-        headers,
-      });
-
-      if (!response.ok) {
-        const text = await response.text();
-        throw new QueueServiceError(
-          `Queue service error: ${response.status}`,
-          response.status,
-          text
-        );
-      }
-
-      return response;
-    } catch (error) {
-      if (error instanceof QueueServiceError) {
-        throw error;
-      }
-
-      console.error(`[queueClient] GET ${url} failed:`, error.message);
-
-      throw new QueueServiceError(
-        'Queue service unavailable',
-        0,
-        { originalError: error.message }
-      );
-    }
+    return request('GET', path, options);
   },
 
   /**
    * POST request
    */
   async post(path, body, options = {}) {
-    const normalizedPath = normalizePath(path);
-    const url = `${getBaseUrl()}${normalizedPath}`;
-
-    console.log(`[queueClient] POST ${url}`);
-
-    const headers = {
-      'Content-Type': 'application/json',
-      ...options.headers,
-    };
-
-    if (options.accessToken) {
-      headers.Authorization = `Bearer ${options.accessToken}`;
-    }
-
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-      });
-
-      if (!response.ok) {
-        const text = await response.text();
-        throw new QueueServiceError(
-          `Queue service error: ${response.status}`,
-          response.status,
-          text
-        );
-      }
-
-      return response;
-    } catch (error) {
-      if (error instanceof QueueServiceError) {
-        throw error;
-      }
-
-      console.error(`[queueClient] POST ${url} failed:`, error.message);
-
-      throw new QueueServiceError(
-        'Queue service unavailable',
-        0,
-        { originalError: error.message }
-      );
-    }
+    return request('POST', path, options, body);
   },
 
   /**
    * DELETE request
    */
   async delete(path, options = {}) {
-    const normalizedPath = normalizePath(path);
-    const url = `${getBaseUrl()}${normalizedPath}`;
-
-    console.log(`[queueClient] DELETE ${url}`);
-
-    const headers = {
-      'Content-Type': 'application/json',
-      ...options.headers,
-    };
-
-    if (options.accessToken) {
-      headers.Authorization = `Bearer ${options.accessToken}`;
-    }
-
-    try {
-      const response = await fetch(url, {
-        method: 'DELETE',
-        headers,
-      });
-
-      if (!response.ok) {
-        const text = await response.text();
-        throw new QueueServiceError(
-          `Queue service error: ${response.status}`,
-          response.status,
-          text
-        );
-      }
-
-      return response;
-    } catch (error) {
-      if (error instanceof QueueServiceError) {
-        throw error;
-      }
-
-      console.error(`[queueClient] DELETE ${url} failed:`, error.message);
-
-      throw new QueueServiceError(
-        'Queue service unavailable',
-        0,
-        { originalError: error.message }
-      );
-    }
+    return request('DELETE', path, options);
   },
 
   /**

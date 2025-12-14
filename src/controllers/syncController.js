@@ -13,37 +13,24 @@ const isNonNegativeNumber = (value) =>
 const sendInvalidBody = (res, field) =>
     res.status(400).json({ error: 'invalid_body', field });
 
-const validateUserId = (userId, res) => {
-    if (!isNonEmptyString(userId)) {
-        sendInvalidBody(res, 'userId');
+/**
+ * Crea un validador genérico para campos del request body
+ * @param {Function} predicate - Función de validación
+ * @param {string} fieldName - Nombre del campo para el mensaje de error
+ * @returns {Function} Validador que retorna true si es válido
+ */
+const createFieldValidator = (predicate, fieldName) => (value, res) => {
+    if (!predicate(value)) {
+        sendInvalidBody(res, fieldName);
         return false;
     }
     return true;
 };
 
-const validateTrackId = (trackId, res) => {
-    if (!isNonEmptyString(trackId)) {
-        sendInvalidBody(res, 'trackId');
-        return false;
-    }
-    return true;
-};
-
-const validateStartPositionMs = (startPositionMs, res) => {
-    if (!isNonNegativeNumber(startPositionMs)) {
-        sendInvalidBody(res, 'startPositionMs');
-        return false;
-    }
-    return true;
-};
-
-const validatePositionMs = (positionMs, res) => {
-    if (!isNonNegativeNumber(positionMs)) {
-        sendInvalidBody(res, 'positionMs');
-        return false;
-    }
-    return true;
-};
+const validateUserId = createFieldValidator(isNonEmptyString, 'userId');
+const validateTrackId = createFieldValidator(isNonEmptyString, 'trackId');
+const validateStartPositionMs = createFieldValidator(isNonNegativeNumber, 'startPositionMs');
+const validatePositionMs = createFieldValidator(isNonNegativeNumber, 'positionMs');
 
 // Helper para el health check de Redis, evita duplicar try/catch
 const pingRedisClient = async (label, client) => {
