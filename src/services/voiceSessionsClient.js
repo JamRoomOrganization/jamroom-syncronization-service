@@ -472,6 +472,17 @@ export async function createOrUpdateVoiceSession({
     ensureServiceAvailable();
     
     const url = `${voiceServiceConfig.baseUrl}/api/v1/voice/sessions`;
+
+    log('info', {
+        op: OP,
+        status: 'request',
+        roomId,
+        userId,
+        latencyMs: 0,
+        requestId,
+        error: `url=${url}`,
+    });
+
     
     try {
         const response = await fetchWithTimeout(url, {
@@ -532,6 +543,20 @@ export async function createOrUpdateVoiceSession({
         if (err instanceof VoiceError || err instanceof VoiceServiceError) {
             throw err;
         }
+
+        const cause = err?.cause;
+        console.error('[voice-client] fetch failed (detailed)', {
+            op: OP,
+            requestId,
+            url,
+            message: err?.message,
+            causeMessage: cause?.message,
+            causeCode: cause?.code,
+            causeErrno: cause?.errno,
+            causeAddress: cause?.address,
+            causePort: cause?.port,
+            latencyMs,
+        });
         
         // Handle timeout/network errors with wrapped VoiceError
         recordError(OP, latencyMs);
