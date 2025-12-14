@@ -6,10 +6,20 @@ import { initRedis, shutdownRedis } from './config/redis.js';
 import { registerSyncRoutes } from './controllers/syncController.js';
 import { initSyncGateway } from './sockets/syncGateway.js';
 import { requestLogger } from './utils/requestLogger.js';
+import { voiceServiceConfig } from './config/voiceServiceConfig.js';
 
 dotenv.config();
 
 const PORT = process.env.PORT || 3001;
+
+console.log("[bootstrap] VOICE_SERVICE_BASE_URL =", process.env.VOICE_SERVICE_BASE_URL);
+console.log("[bootstrap] INTERNAL_API_KEY =", process.env.INTERNAL_API_KEY ? "SET" : "NOT SET");
+console.log("[bootstrap] NODE_ENV =", process.env.NODE_ENV);
+console.log("[bootstrap] voiceServiceConfig =", {
+  baseUrl: voiceServiceConfig.baseUrl,
+  isAvailable: voiceServiceConfig.isAvailable,
+  timeoutMs: voiceServiceConfig.timeoutMs,
+});
 
 const toArray = (value) =>
     typeof value === 'string' && value.length
