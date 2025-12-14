@@ -489,6 +489,7 @@ export async function createOrUpdateVoiceSession({
             method: 'POST',
             headers: getCommonHeaders({
                 'Content-Type': 'application/json',
+                ...(requestId ? { 'x-request-id': requestId } : {}),
             }),
             body: JSON.stringify({
                 roomId,
